@@ -1,0 +1,51 @@
+# Go binaries and build artifacts
+/bin/
+/dist/
+/build/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go workspace and vendored dependencies
+# Keep go.work and go.work.sum committed for this monorepo
+/vendor/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+!.env.test.example
+
+# Logs
+*.log
+logs/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Test and coverage outputs
+coverage.out
+coverage.html
+*.coverprofile
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Generated pipeline exports
+exports/
