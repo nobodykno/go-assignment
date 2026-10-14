@@ -2,7 +2,7 @@ go 1.27.2
 
 use (
 	./apps/api
-	./packages/models
+	./packages
 	./services/aggregation
 	./services/export
 	./services/ingestion
