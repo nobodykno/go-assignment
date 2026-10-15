@@ -1,22 +1,25 @@
-
 package main
 
 import (
 	"log"
+	"net/http"
 
 	"go-assignment/apps/api/middleware"
 	"go-assignment/apps/api/route"
 	sharedDB "go-assignment/packages/database"
 
-	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 )
 
 func main() {
+	// Load environment variables.
 	if err := godotenv.Load(); err != nil {
-		log.Fatalf("Error loading .env file: %v", err)
+		log.Println("No .env file found; using environment variables")
 	}
+
 	log.Println("Environment variables loaded")
+
+	// Connect to PostgreSQL once.
 	db, err := sharedDB.Connect()
 	if err != nil {
 		log.Fatalf("Database connection failed: %v", err)
@@ -24,14 +27,21 @@ func main() {
 
 	log.Println("Connected to PostgreSQL successfully")
 
-	// We'll inject db into services that need database access.
-	_ = db
+	// Create all API routes and dependencies.
+	v1Router := route.NewRouter(db)
 
-	router := gin.Default()
-	router.Use(middleware.RateLimit())
-	route.RegisterRoutes(router)
+	// Create the root router.
+	mux := http.NewServeMux()
 
-	if err := router.Run(":8080"); err != nil {
+	// Apply rate limiting to versioned API routes.
+	v1Handler := middleware.RateLimit(
+		http.StripPrefix("/v1", v1Router),
+	)
+	mux.Handle("/v1/", v1Handler)
+
+	log.Println("API server listening on :8080")
+
+	if err := http.ListenAndServe(":8080", mux); err != nil {
 		log.Fatal(err)
 	}
 }

@@ -1,11 +1,22 @@
-
 package route
 
-import "github.com/gin-gonic/gin"
+import (
+	"net/http"
 
-func RegisterRoutes(router *gin.Engine) {
-	v1 := router.Group("/v1")
+	"go-assignment/apps/api/controller"
+)
 
-	RegisterHealthRoutes(v1)
+func RegisterRoutes(
+	router *http.ServeMux,
+	jobController *controller.JobController,
+) {
+	// Jobs parent route
+	jobs := http.NewServeMux()
+	RegisterJobRoutes(jobs, jobController)
+	router.Handle("/jobs/", http.StripPrefix("/jobs", jobs))
 
+	// Health parent route
+	health := http.NewServeMux()
+	RegisterHealthRoutes(health)
+	router.Handle("/health/", http.StripPrefix("/health", health))
 }

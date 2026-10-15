@@ -2,40 +2,48 @@
 package middleware
 
 import (
-    "net/http"
-    "sync"
-    "time"
-
-    "github.com/gin-gonic/gin"
+	"encoding/json"
+	"net"
+	"net/http"
+	"sync"
+	"time"
 )
 
-func RateLimit() gin.HandlerFunc {
-    var mu sync.Mutex
-    requests := make(map[string]int)
-    windowStart := time.Now()
+func RateLimit(next http.Handler) http.Handler {
+	var mu sync.Mutex
+	requests := make(map[string]int)
+	windowStart := time.Now()
 
-    return func(c *gin.Context) {
-        ip := c.ClientIP()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			ip = r.RemoteAddr
+		}
 
-        mu.Lock()
+		mu.Lock()
 
-        if time.Since(windowStart) >= 60*time.Second {
-            requests = make(map[string]int)
-            windowStart = time.Now()
-        }
+		// Reset the request counts every 60 seconds.
+		if time.Since(windowStart) >= 60*time.Second {
+			requests = make(map[string]int)
+			windowStart = time.Now()
+		}
 
-        if requests[ip] >= 100 {
-            mu.Unlock()
+		if requests[ip] >= 100 {
+			mu.Unlock()
 
-            c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-                "message": "Too many requests",
-            })
-            return
-        }
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
 
-        requests[ip]++
-        mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"message": "Too many requests",
+			})
+			return
+		}
 
-        c.Next()
-    }
+		requests[ip]++
+		mu.Unlock()
+
+		// Continue to the next handler.
+		next.ServeHTTP(w, r)
+	})
 }

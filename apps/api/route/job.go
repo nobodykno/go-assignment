@@ -1,11 +1,14 @@
 package route
 
 import (
-	"go-assignment/apps/api/controllers"
+	"net/http"
 
-	"github.com/gin-gonic/gin"
+	"go-assignment/apps/api/controller"
 )
 
-func createNewJob(router *gin.RouterGroup) {
-	router.POST("/jobs", gin.WrapF(controller.CheckHealth))
+func RegisterJobRoutes(
+	router *http.ServeMux,
+	jobController *controller.JobController,
+) {
+	router.HandleFunc("POST /submit", jobController.CreateJob)
 }

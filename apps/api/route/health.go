@@ -1,11 +1,11 @@
 package route
 
 import (
-	"go-assignment/apps/api/controllers"
+	"net/http"
 
-	"github.com/gin-gonic/gin"
+	"go-assignment/apps/api/controller"
 )
 
-func RegisterHealthRoutes(router *gin.RouterGroup) {
-	router.GET("/health", gin.WrapF(controller.CheckHealth))
+func RegisterHealthRoutes(router *http.ServeMux) {
+	router.HandleFunc("GET /health", controller.CheckHealth)
 }
