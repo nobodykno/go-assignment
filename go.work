@@ -1,6 +1,8 @@
 go 1.27.2
 
 use (
-	./apps/api
-	./packages
+    ./apps/api
+    ./packages
+    ./services/ingestion
+	./services/ingestion-worker
 )

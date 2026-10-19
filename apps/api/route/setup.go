@@ -17,16 +17,12 @@ func NewRouter(db *gorm.DB) *http.ServeMux {
 		DB: db,
 	}
 
-	jobController := &controller.JobController{
-		JobService: jobService,
-	}
 
 	uploadController := &controller.UploadController{
 		JobService: jobService,
 	}
 
 	controllers := &controller.Controllers{
-		Job:    jobController,
 		Upload: uploadController,
 	}
 
