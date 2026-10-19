@@ -13,18 +13,24 @@ import (
 func NewRouter(db *gorm.DB) *http.ServeMux {
 	router := http.NewServeMux()
 
-	// Create the job service using the existing DB handle.
 	jobService := &service.JobService{
 		DB: db,
 	}
 
-	// Inject the service into the controller.
 	jobController := &controller.JobController{
 		JobService: jobService,
 	}
 
-	// Register job and health endpoints.
-	RegisterRoutes(router, jobController)
+	uploadController := &controller.UploadController{
+		JobService: jobService,
+	}
+
+	controllers := &controller.Controllers{
+		Job:    jobController,
+		Upload: uploadController,
+	}
+
+	RegisterRoutes(router, controllers)
 
 	return router
 }

@@ -8,15 +8,17 @@ import (
 
 func RegisterRoutes(
 	router *http.ServeMux,
-	jobController *controller.JobController,
+	controllers *controller.Controllers,
 ) {
-	// Jobs parent route
 	jobs := http.NewServeMux()
-	RegisterJobRoutes(jobs, jobController)
+	RegisterJobRoutes(jobs, controllers.Job)
 	router.Handle("/jobs/", http.StripPrefix("/jobs", jobs))
 
-	// Health parent route
 	health := http.NewServeMux()
 	RegisterHealthRoutes(health)
 	router.Handle("/health/", http.StripPrefix("/health", health))
+
+	upload := http.NewServeMux()
+	RegisterUploadRoutes(upload, controllers.Upload)
+	router.Handle("/upload/", http.StripPrefix("/upload", upload))
 }
