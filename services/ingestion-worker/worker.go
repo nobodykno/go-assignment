@@ -31,9 +31,9 @@ type ValidateRequest struct {
 }
 
 type ValidationResult struct {
-	RecordNumber int      `json:"record_number"`
+	RecordNumber int               `json:"record_number"`
 	Record       map[string]string `json:"record"`
-	Errors       []string `json:"errors"`
+	Errors       []string          `json:"errors"`
 }
 
 type ValidateResponse struct {
@@ -44,6 +44,7 @@ type ValidateResponse struct {
 	Results        []ValidationResult `json:"results"`
 }
 
+// Run continuously looks for pending jobs until the context is cancelled.
 func (w *JobWorker) Run(ctx context.Context) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -67,10 +68,11 @@ func (w *JobWorker) Run(ctx context.Context) {
 	}
 }
 
+// processPendingJob claims and processes the oldest pending job.
 func (w *JobWorker) processPendingJob(ctx context.Context) error {
 	var job models.Job
 
-	err := w.DB.
+	err := w.DB.WithContext(ctx).
 		Where("status = ?", "pending").
 		Order("created_at ASC").
 		First(&job).Error
@@ -83,17 +85,18 @@ func (w *JobWorker) processPendingJob(ctx context.Context) error {
 	}
 
 	// Claim the job only if it is still pending.
-	result := w.DB.Model(&models.Job{}).
+	claim := w.DB.WithContext(ctx).
+		Model(&models.Job{}).
 		Where("id = ? AND status = ?", job.ID, "pending").
 		Updates(map[string]interface{}{
 			"status":        "processing",
 			"error_message": nil,
 		})
 
-	if result.Error != nil {
-		return result.Error
+	if claim.Error != nil {
+		return claim.Error
 	}
-	if result.RowsAffected == 0 {
+	if claim.RowsAffected == 0 {
 		return nil
 	}
 
@@ -107,11 +110,11 @@ func (w *JobWorker) processPendingJob(ctx context.Context) error {
 		return w.failJob(job.ID, err.Error())
 	}
 
-	if ctx.Err() != nil {
-		return ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return w.failJob(job.ID, err.Error())
 	}
 
-	// Convert ingestion records into the JSON request format.
+	// Convert ingestion records into the validation request format.
 	requestRecords := make([]map[string]string, 0, len(records))
 
 	for _, record := range records {
@@ -121,7 +124,11 @@ func (w *JobWorker) processPendingJob(ctx context.Context) error {
 		)
 	}
 
-	// Send all records in one batch to the validation service.
+	if len(requestRecords) == 0 {
+		return w.failJob(job.ID, "uploaded file contains no records")
+	}
+
+	// Send records to the validation service.
 	validationResponse, err := w.validateRecords(
 		ctx,
 		job.ID,
@@ -129,12 +136,26 @@ func (w *JobWorker) processPendingJob(ctx context.Context) error {
 	)
 	if err != nil {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return w.failJob(job.ID, ctx.Err().Error())
 		}
 		return w.failJob(job.ID, err.Error())
 	}
 
-	// Collect validation errors for storage and logging.
+	// Verify that the response accounts for every submitted record.
+	if validationResponse.TotalRecords != len(requestRecords) ||
+		len(validationResponse.Results) != validationResponse.TotalRecords {
+		return w.failJob(
+			job.ID,
+			fmt.Sprintf(
+				"validation result count mismatch: submitted %d, reported total %d, returned results %d",
+				len(requestRecords),
+				validationResponse.TotalRecords,
+				len(validationResponse.Results),
+			),
+		)
+	}
+
+	// Collect validation errors for the job summary.
 	var errorMessages []string
 
 	for _, result := range validationResponse.Results {
@@ -152,19 +173,78 @@ func (w *JobWorker) processPendingJob(ctx context.Context) error {
 
 	errorMessage := strings.Join(errorMessages, "; ")
 
-	// Every returned result counts as processed, including invalid records.
+	// Convert each validation result into a database model.
+	jobRecords := make([]models.JobRecord, 0, len(validationResponse.Results))
 
-	return w.DB.Model(&models.Job{}).
-    Where("id = ?", job.ID).
-    Updates(map[string]interface{}{
-        "status":            "validated",
-        "total_records":     validationResponse.TotalRecords,
-        "processed_records": len(validationResponse.Results),
-        "invalid_records":   validationResponse.InvalidRecords,
-        "error_message":     nullableMessage(errorMessage),
-    }).Error
+	for i := 0; i < len(validationResponse.Results); i++ {
+		result := validationResponse.Results[i]
+	
+		validationErrors := result.Errors
+		if validationErrors == nil {
+			validationErrors = []string{}
+		}
+	
+		jobRecords = append(jobRecords, models.JobRecord{
+			JobID:            job.ID,
+			RecordNumber:     result.RecordNumber,
+			RecordData:       result.Record,
+			IsValid:          len(result.Errors) == 0,
+			ValidationErrors: validationErrors,
+		})
+	}
+	if err := ctx.Err(); err != nil {
+		return w.failJob(job.ID, err.Error())
+	}
+
+	// Save the records and job summary in one transaction.
+	err = w.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if len(jobRecords) > 0 {
+			if err := tx.CreateInBatches(&jobRecords, 500).Error; err != nil {
+				return fmt.Errorf("save validation results: %w", err)
+			}
+		}
+
+		result := tx.Model(&models.Job{}).
+			Where("id = ? AND status = ?", job.ID, "processing").
+			Updates(map[string]interface{}{
+				"status":            "validated",
+				"total_records":     validationResponse.TotalRecords,
+				"processed_records": len(validationResponse.Results),
+				"valid_records":     validationResponse.ValidRecords,
+				"invalid_records":   validationResponse.InvalidRecords,
+				"error_message":     nullableMessage(errorMessage),
+			})
+
+		if result.Error != nil {
+			return fmt.Errorf("update job summary: %w", result.Error)
+		}
+
+		if result.RowsAffected == 0 {
+			return fmt.Errorf(
+				"job %d was not found or is no longer processing",
+				job.ID,
+			)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("persist job %d validation results: %w", job.ID, err)
+	}
+
+	log.Printf(
+		"job %d validated: total=%d valid=%d invalid=%d",
+		job.ID,
+		validationResponse.TotalRecords,
+		validationResponse.ValidRecords,
+		validationResponse.InvalidRecords,
+	)
+
+	return nil
 }
 
+// validateRecords sends a batch of records to the validation service.
 func (w *JobWorker) validateRecords(
 	ctx context.Context,
 	jobID uint,
@@ -219,6 +299,7 @@ func (w *JobWorker) validateRecords(
 	}
 
 	var response ValidateResponse
+
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
 		return nil, fmt.Errorf("decode validation response: %w", err)
 	}
@@ -234,6 +315,7 @@ func (w *JobWorker) validateRecords(
 	return &response, nil
 }
 
+// nullableMessage returns nil when there is no error message.
 func nullableMessage(message string) interface{} {
 	if message == "" {
 		return nil
@@ -241,6 +323,7 @@ func nullableMessage(message string) interface{} {
 	return message
 }
 
+// failJob marks a job as failed.
 func (w *JobWorker) failJob(jobID uint, message string) error {
 	return w.DB.Model(&models.Job{}).
 		Where("id = ?", jobID).

@@ -1,4 +1,3 @@
-
 # Build stage
 FROM golang:1.27.2-alpine AS builder
 
@@ -15,6 +14,7 @@ COPY packages/go.mod ./packages/go.mod
 COPY services/ingestion/go.mod ./services/ingestion/go.mod
 COPY services/ingestion-worker/go.mod ./services/ingestion-worker/go.mod
 COPY services/validation/go.mod ./services/validation/go.mod
+COPY services/transformation/go.mod ./services/transformation/go.mod
 
 # Copy source code for all workspace modules
 COPY apps/api ./apps/api
@@ -22,6 +22,7 @@ COPY packages ./packages
 COPY services/ingestion ./services/ingestion
 COPY services/ingestion-worker ./services/ingestion-worker
 COPY services/validation ./services/validation
+COPY services/transformation ./services/transformation
 
 WORKDIR /app/apps/api
 

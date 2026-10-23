@@ -6,4 +6,5 @@ use (
     ./services/ingestion
 	./services/ingestion-worker
 	./services/validation
+    ./services/transformation
 )
