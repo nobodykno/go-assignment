@@ -20,42 +20,41 @@ type TransformationWorker struct {
 	DB *gorm.DB
 }
 
-// Run continuously looks for validated jobs until the context is cancelled.
+// Run continuously checks for validated jobs until the context is cancelled.
 func (w *TransformationWorker) Run(ctx context.Context) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
-	log.Println("transformation worker started")
+	log.Println("Transformation worker started")
 
 	for {
 		if err := ctx.Err(); err != nil {
-			log.Println("transformation worker stopped")
+			log.Println("Transformation worker stopped")
 			return
 		}
 
 		if err := w.processPendingJob(ctx); err != nil {
-			// Do not log cancellation as a processing error.
-			if ctx.Err() != nil {
-				log.Println("transformation worker stopped")
-				return
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				if ctx.Err() != nil {
+					log.Println("Transformation worker stopped")
+					return
+				}
 			}
 
-			log.Printf("transformation worker error: %v", err)
+			log.Printf("Transformation worker error: %v", err)
 		}
 
 		select {
 		case <-ctx.Done():
-			log.Println("transformation worker stopped")
+			log.Println("Transformation worker stopped")
 			return
 		case <-ticker.C:
 		}
 	}
 }
 
-// processPendingJob claims and transforms one validated job.
-func (w *TransformationWorker) processPendingJob(
-	ctx context.Context,
-) error {
+// processPendingJob claims and processes the oldest validated job.
+func (w *TransformationWorker) processPendingJob(ctx context.Context) error {
 	var job models.Job
 
 	err := w.DB.WithContext(ctx).
@@ -71,7 +70,8 @@ func (w *TransformationWorker) processPendingJob(
 		return fmt.Errorf("find validated job: %w", err)
 	}
 
-	// Claim the job only if it is still validated.
+	// Claim the job atomically so another worker cannot claim it
+	// after its status has already changed.
 	claim := w.DB.WithContext(ctx).
 		Model(&models.Job{}).
 		Where("id = ? AND status = ?", job.ID, "validated").
@@ -86,6 +86,8 @@ func (w *TransformationWorker) processPendingJob(
 		return nil
 	}
 
+	log.Printf("Started transformation for job %d", job.ID)
+
 	// Load only records that passed validation.
 	var records []models.JobRecord
 
@@ -98,7 +100,7 @@ func (w *TransformationWorker) processPendingJob(
 		return w.failJob(
 			ctx,
 			job.ID,
-			fmt.Sprintf("load valid records: %v", err),
+			fmt.Sprintf("load records: %v", err),
 		)
 	}
 
@@ -108,25 +110,66 @@ func (w *TransformationWorker) processPendingJob(
 		len(records),
 	)
 
-	// Transform every valid record.
-	for _, record := range records {
+	transformationFailures := 0
+
+	// Transform records individually. A single bad record should not
+	// prevent other valid records from being transformed.
+	for i := range records {
 		if err := ctx.Err(); err != nil {
 			return w.failJob(ctx, job.ID, err.Error())
 		}
 
-		transformed, err := TransformRecord(
-			Record(record.RecordData),
+		transformed, transformErr := TransformRecord(
+			Record(records[i].RecordData),
 		)
-		if err != nil {
-			return w.failJob(
-				ctx,
-				job.ID,
-				fmt.Sprintf(
-					"record %d transformation failed: %v",
-					record.RecordNumber,
-					err,
-				),
+
+		if transformErr != nil {
+			transformationFailures++
+
+			message := fmt.Sprintf(
+				"transformation failed: %v",
+				transformErr,
 			)
+
+			// Preserve existing validation errors and append the
+			// transformation error. IsValid remains unchanged.
+			records[i].ValidationErrors = append(
+				records[i].ValidationErrors,
+				message,
+			)
+
+			updateRecord := w.DB.WithContext(ctx).
+				Model(&models.JobRecord{}).
+				Where(
+					"id = ? AND job_id = ?",
+					records[i].ID,
+					job.ID,
+				).
+				Update(
+					"validation_errors",
+					records[i].ValidationErrors,
+				)
+
+			if updateRecord.Error != nil {
+				return w.failJob(
+					ctx,
+					job.ID,
+					fmt.Sprintf(
+						"save transformation error for record %d: %v",
+						records[i].RecordNumber,
+						updateRecord.Error,
+					),
+				)
+			}
+
+			log.Printf(
+				"Job %d: record %d transformation failed: %v",
+				job.ID,
+				records[i].RecordNumber,
+				transformErr,
+			)
+
+			continue
 		}
 
 		transformedRecords = append(
@@ -139,7 +182,44 @@ func (w *TransformationWorker) processPendingJob(
 		return w.failJob(ctx, job.ID, err.Error())
 	}
 
-	// Choose the output directory.
+	// Preserve a summary when some records fail transformation.
+	var errorSummary *string
+
+	if transformationFailures > 0 {
+		summary := fmt.Sprintf(
+			"%d record(s) failed transformation",
+			transformationFailures,
+		)
+		errorSummary = &summary
+	}
+
+	// Use a map so GORM writes error_message even when its value is nil.
+	summaryUpdate := w.DB.WithContext(ctx).
+		Model(&models.Job{}).
+		Where("id = ? AND status = ?", job.ID, "transforming").
+		Updates(map[string]interface{}{
+			"error_message": errorSummary,
+		})
+
+	if summaryUpdate.Error != nil {
+		return w.failJob(
+			ctx,
+			job.ID,
+			fmt.Sprintf(
+				"save transformation summary: %v",
+				summaryUpdate.Error,
+			),
+		)
+	}
+
+	if summaryUpdate.RowsAffected == 0 {
+		return fmt.Errorf(
+			"job %d is no longer transforming",
+			job.ID,
+		)
+	}
+
+	// Write transformed records to the configured output directory.
 	outputDir := os.Getenv("TRANSFORMED_OUTPUT_DIR")
 	if outputDir == "" {
 		outputDir = "./output"
@@ -153,13 +233,13 @@ func (w *TransformationWorker) processPendingJob(
 		)
 	}
 
-	// Build the output filename for this job.
 	outputPath := filepath.Join(
 		outputDir,
 		fmt.Sprintf("job-%d-transformed.json", job.ID),
 	)
 
-	// Write to a temporary file before publishing the result.
+	// Write to a temporary file first so the final output is not
+	// exposed as a partially written JSON file.
 	tempFile, err := os.CreateTemp(
 		outputDir,
 		fmt.Sprintf("job-%d-*.tmp", job.ID),
@@ -173,13 +253,7 @@ func (w *TransformationWorker) processPendingJob(
 	}
 
 	tempPath := tempFile.Name()
-	tempFileClosed := false
-
-	// Ensure the temporary file is removed if processing fails.
 	defer func() {
-		if !tempFileClosed {
-			_ = tempFile.Close()
-		}
 		_ = os.Remove(tempPath)
 	}()
 
@@ -187,6 +261,8 @@ func (w *TransformationWorker) processPendingJob(
 	encoder.SetIndent("", "  ")
 
 	if err := encoder.Encode(transformedRecords); err != nil {
+		_ = tempFile.Close()
+
 		return w.failJob(
 			ctx,
 			job.ID,
@@ -195,47 +271,44 @@ func (w *TransformationWorker) processPendingJob(
 	}
 
 	if err := tempFile.Close(); err != nil {
-		tempFileClosed = true
 		return w.failJob(
 			ctx,
 			job.ID,
 			fmt.Sprintf("close temporary output file: %v", err),
 		)
 	}
-	tempFileClosed = true
 
 	if err := ctx.Err(); err != nil {
 		return w.failJob(ctx, job.ID, err.Error())
 	}
 
-	// Publish the completed output file.
 	if err := os.Rename(tempPath, outputPath); err != nil {
 		return w.failJob(
 			ctx,
 			job.ID,
-			fmt.Sprintf("publish transformed output: %v", err),
+			fmt.Sprintf("finalize transformed output: %v", err),
 		)
 	}
 
-	// Save the output path and mark the job as transformed.
-	result := w.DB.WithContext(ctx).
+	// Mark the job as transformed. Do not clear error_message here:
+	// it may contain the partial-transformation failure summary.
+	finalUpdate := w.DB.WithContext(ctx).
 		Model(&models.Job{}).
 		Where("id = ? AND status = ?", job.ID, "transforming").
 		Updates(map[string]interface{}{
 			"status":                "transformed",
 			"transformed_file_path": outputPath,
-			"error_message":         nil,
 		})
 
-	if result.Error != nil {
+	if finalUpdate.Error != nil {
 		return fmt.Errorf(
-			"save transformation result for job %d: %w",
+			"save transformed status for job %d: %w",
 			job.ID,
-			result.Error,
+			finalUpdate.Error,
 		)
 	}
 
-	if result.RowsAffected == 0 {
+	if finalUpdate.RowsAffected == 0 {
 		return fmt.Errorf(
 			"job %d is no longer transforming",
 			job.ID,
@@ -243,22 +316,32 @@ func (w *TransformationWorker) processPendingJob(
 	}
 
 	log.Printf(
-		"job %d transformed successfully: records=%d output=%s",
+		"Job %d transformation completed: output_records=%d, transformation_failures=%d, output=%s",
 		job.ID,
 		len(transformedRecords),
+		transformationFailures,
 		outputPath,
 	)
 
 	return nil
 }
 
-// failJob marks a job as failed.
+// failJob marks a transforming job as failed.
+//
+// A separate bounded context allows the failure status to be saved
+// even if the original processing context has been cancelled.
 func (w *TransformationWorker) failJob(
 	ctx context.Context,
 	jobID uint,
 	message string,
 ) error {
-	result := w.DB.WithContext(ctx).
+	cleanupCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		5*time.Second,
+	)
+	defer cancel()
+
+	result := w.DB.WithContext(cleanupCtx).
 		Model(&models.Job{}).
 		Where("id = ? AND status = ?", jobID, "transforming").
 		Updates(map[string]interface{}{
@@ -268,20 +351,22 @@ func (w *TransformationWorker) failJob(
 
 	if result.Error != nil {
 		return fmt.Errorf(
-			"mark job %d as failed: %w",
+			"job %d failed (%s); also failed to save failure status: %w",
 			jobID,
+			message,
 			result.Error,
 		)
 	}
 
 	if result.RowsAffected == 0 {
 		return fmt.Errorf(
-			"could not mark job %d as failed: job is no longer transforming",
+			"job %d could not be marked failed; it may no longer be transforming: %s",
 			jobID,
+			message,
 		)
 	}
 
-	log.Printf("job %d marked as failed: %s", jobID, message)
+	log.Printf("Job %d marked as failed: %s", jobID, message)
 
-	return nil
+	return fmt.Errorf("job %d transformation failed: %s", jobID, message)
 }

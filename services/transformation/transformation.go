@@ -8,38 +8,60 @@ import (
 	"time"
 )
 
-// Record represents the raw data received from a CSV file.
+// Record represents raw data received from a CSV, JSON, or API source.
 type Record map[string]string
 
-// TransformedRecord represents the normalized record.
+// TransformedRecord represents a normalized record.
 type TransformedRecord struct {
 	Date   string `json:"date"`
 	Cases  int    `json:"cases"`
 	Deaths int    `json:"deaths"`
 }
 
-// TransformRecord converts one raw record into structured data.
+// TransformRecord validates and transforms one raw record.
 func TransformRecord(record Record) (TransformedRecord, error) {
 	dateValue := strings.TrimSpace(record["date"])
 	casesValue := strings.TrimSpace(record["cases"])
 	deathsValue := strings.TrimSpace(record["deaths"])
 
-	// Normalize and verify the date.
+	if dateValue == "" {
+		return TransformedRecord{}, fmt.Errorf("date is required")
+	}
+	if casesValue == "" {
+		return TransformedRecord{}, fmt.Errorf("cases is required")
+	}
+	if deathsValue == "" {
+		return TransformedRecord{}, fmt.Errorf("deaths is required")
+	}
+
+	// Parse and normalize the date.
 	parsedDate, err := time.Parse("2006-01-02", dateValue)
 	if err != nil {
-		return TransformedRecord{}, fmt.Errorf("invalid date: %w", err)
+		return TransformedRecord{}, fmt.Errorf(
+			"invalid date %q: expected YYYY-MM-DD: %w",
+			dateValue,
+			err,
+		)
 	}
 
-	// Convert cases from string to integer.
+	// Convert cases to an integer.
 	cases, err := strconv.Atoi(casesValue)
 	if err != nil {
-		return TransformedRecord{}, fmt.Errorf("invalid cases: %w", err)
+		return TransformedRecord{}, fmt.Errorf(
+			"invalid cases %q: %w",
+			casesValue,
+			err,
+		)
 	}
 
-	// Convert deaths from string to integer.
+	// Convert deaths to an integer.
 	deaths, err := strconv.Atoi(deathsValue)
 	if err != nil {
-		return TransformedRecord{}, fmt.Errorf("invalid deaths: %w", err)
+		return TransformedRecord{}, fmt.Errorf(
+			"invalid deaths %q: %w",
+			deathsValue,
+			err,
+		)
 	}
 
 	if cases < 0 || deaths < 0 {

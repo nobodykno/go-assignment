@@ -17,6 +17,7 @@ type Job struct {
     ValidRecords     int        `gorm:"not null;default:0" json:"valid_records"`
     InvalidRecords   int        `gorm:"not null;default:0" json:"invalid_records"`
     TransformedFilePath string `gorm:"column:transformed_file_path;type:text;not null;default:''" json:"transformed_file_path"`
+    AggregatedFilePath string `gorm:"column:aggregated_file_path;type:text;not null;default:''" json:"aggregated_file_path"`
 }
 
 
