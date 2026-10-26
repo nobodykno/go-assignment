@@ -1,7 +1,9 @@
+
 package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,11 +21,11 @@ type ValidateRequest struct {
 }
 
 type ValidateResponse struct {
-	JobID         uint               `json:"job_id"`
-	TotalRecords  int                `json:"total_records"`
-	ValidRecords  int                `json:"valid_records"`
-	InvalidRecords int               `json:"invalid_records"`
-	Results       []ValidationResult `json:"results"`
+	JobID          uint               `json:"job_id"`
+	TotalRecords   int                `json:"total_records"`
+	ValidRecords   int                `json:"valid_records"`
+	InvalidRecords int                `json:"invalid_records"`
+	Results        []ValidationResult `json:"results"`
 }
 
 type ErrorResponse struct {
@@ -33,6 +35,10 @@ type ErrorResponse struct {
 // NewHandler registers the validation service endpoints.
 func NewHandler(workerCount int) http.Handler {
 	mux := http.NewServeMux()
+
+	if workerCount < 1 {
+		workerCount = 1
+	}
 
 	handler := &ValidationHandler{
 		Pool: WorkerPool{
@@ -69,15 +75,22 @@ func (h *ValidationHandler) Validate(
 	var request ValidateRequest
 
 	if err := decoder.Decode(&request); err != nil {
-		writeJSON(w, http.StatusBadRequest, ErrorResponse{
-			Error: fmt.Sprintf("invalid request body: %v", err),
-		})
+		status := http.StatusBadRequest
+		message := fmt.Sprintf("invalid request body: %v", err)
+
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			status = http.StatusRequestEntityTooLarge
+			message = "request body exceeds the 5 MB limit"
+		}
+
+		writeJSON(w, status, ErrorResponse{Error: message})
 		return
 	}
 
-	// Reject additional JSON values after the request.
-	var extra interface{}
-	if err := decoder.Decode(&extra); err != io.EOF {
+	// Reject additional JSON values after the request object.
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error: "request must contain a single JSON object",
 		})
@@ -108,6 +121,8 @@ func (h *ValidationHandler) Validate(
 		return
 	}
 
+	ctx := r.Context()
+
 	input := make(chan RecordJob, len(request.Records))
 	output := make(chan ValidationResult, len(request.Records))
 
@@ -117,11 +132,10 @@ func (h *ValidationHandler) Validate(
 			Record:       record,
 		}
 	}
-
 	close(input)
 
-	// Run the worker pool concurrently with result collection.
-	go h.Pool.Run(r.Context(), input, output)
+	// Run the worker pool concurrently.
+	go h.Pool.Run(ctx, input, output)
 
 	response := ValidateResponse{
 		JobID:        request.JobID,
@@ -129,18 +143,28 @@ func (h *ValidationHandler) Validate(
 		Results:      make([]ValidationResult, 0, len(request.Records)),
 	}
 
-	for result := range output {
-		if len(result.Errors) == 0 {
-			result.Errors = []string{}
-			response.ValidRecords++
-		} else {
-			response.InvalidRecords++
+	for {
+		select {
+		case <-ctx.Done():
+			// The client disconnected or cancelled the request.
+			return
+
+		case result, ok := <-output:
+			if !ok {
+				writeJSON(w, http.StatusOK, response)
+				return
+			}
+
+			if len(result.Errors) == 0 {
+				result.Errors = []string{}
+				response.ValidRecords++
+			} else {
+				response.InvalidRecords++
+			}
+
+			response.Results = append(response.Results, result)
 		}
-
-		response.Results = append(response.Results, result)
 	}
-
-	writeJSON(w, http.StatusOK, response)
 }
 
 func writeJSON(
@@ -151,7 +175,5 @@ func writeJSON(
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		return
-	}
+	_ = json.NewEncoder(w).Encode(data)
 }

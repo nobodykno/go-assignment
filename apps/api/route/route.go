@@ -1,3 +1,4 @@
+
 package route
 
 import (
@@ -10,13 +11,9 @@ func RegisterRoutes(
 	router *http.ServeMux,
 	controllers *controller.Controllers,
 ) {
-	health := http.NewServeMux()
-	RegisterHealthRoutes(health)
-
-	router.Handle(
-		"/health/",
-		http.StripPrefix("/health", health),
-	)
-
+	RegisterHealthRoutes(router)
 	RegisterUploadRoutes(router, controllers.Upload)
+	RegisterSourceRoutes(router, controllers.Source)
+	RegisterJobsRoutes(router, controllers.Jobs)
+	RegisterPipelineErrorsRoutes(router, controllers.PipelineErrors)
 }

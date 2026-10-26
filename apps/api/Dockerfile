@@ -1,3 +1,4 @@
+
 # Build stage
 FROM golang:1.27.2-alpine AS builder
 
@@ -5,29 +6,37 @@ WORKDIR /app
 
 RUN apk add --no-cache git ca-certificates
 
-# Copy the workspace manifest
-COPY go.work ./
+# Copy the Go workspace manifests.
+COPY go.work go.work.sum ./
 
-# Copy all module manifests
-COPY apps/api/go.mod ./apps/api/go.mod
-COPY packages/go.mod ./packages/go.mod
-COPY services/ingestion/go.mod ./services/ingestion/go.mod
-COPY services/ingestion-worker/go.mod ./services/ingestion-worker/go.mod
-COPY services/validation/go.mod ./services/validation/go.mod
-COPY services/transformation/go.mod ./services/transformation/go.mod
-COPY services/aggregation/go.mod ./services/aggregation/go.mod
-# Copy source code for all workspace modules
+# Copy module manifests first for dependency caching.
+COPY apps/api/go.mod apps/api/go.sum ./apps/api/
+COPY packages/go.mod packages/go.sum ./packages/
+
+COPY services/ingestion/go.mod ./services/ingestion/
+COPY services/ingestion-worker/go.mod ./services/ingestion-worker/
+COPY services/validation/go.mod ./services/validation/
+COPY services/transformation/go.mod ./services/transformation/
+COPY services/aggregation/go.mod ./services/aggregation/
+COPY services/export/go.mod ./services/export/
+
+# Copy all workspace module source code.
 COPY apps/api ./apps/api
 COPY packages ./packages
 COPY services/ingestion ./services/ingestion
 COPY services/ingestion-worker ./services/ingestion-worker
 COPY services/validation ./services/validation
+COPY services/transformation ./services/transformation
 COPY services/aggregation ./services/aggregation
+COPY services/export ./services/export
 
+# Download dependencies and build the API.
 WORKDIR /app/apps/api
 
 RUN go mod download
-RUN CGO_ENABLED=0 GOOS=linux go build -o /app/bin/api .
+
+RUN mkdir -p /app/bin && \
+    CGO_ENABLED=0 GOOS=linux go build -o /app/bin/api .
 
 # Runtime stage
 FROM alpine:3.22

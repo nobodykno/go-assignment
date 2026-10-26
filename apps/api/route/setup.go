@@ -17,13 +17,25 @@ func NewRouter(db *gorm.DB) *http.ServeMux {
 		DB: db,
 	}
 
-
 	uploadController := &controller.UploadController{
 		JobService: jobService,
 	}
 
+	sourceController := &controller.SourceController{
+		DB: db,
+	}
+
+	jobsController := controller.NewJobsController(jobService)
+
+	pipelineErrorsController := &controller.PipelineErrorsController{
+		DB: db,
+	}
+
 	controllers := &controller.Controllers{
 		Upload: uploadController,
+		Source: sourceController,
+		Jobs:   jobsController,
+		PipelineErrors: pipelineErrorsController,
 	}
 
 	RegisterRoutes(router, controllers)

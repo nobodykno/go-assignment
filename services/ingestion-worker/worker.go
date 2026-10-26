@@ -13,7 +13,7 @@ import (
 	"os"
 	"strings"
 	"time"
-
+    pipelineerrors "go-assignment/packages/errors"
 	"go-assignment/packages/models"
 	"go-assignment/services/ingestion"
 
@@ -21,8 +21,9 @@ import (
 )
 
 type JobWorker struct {
-	DB         *gorm.DB
-	HTTPClient *http.Client
+	DB             *gorm.DB
+	HTTPClient     *http.Client
+	ErrorCollector *pipelineerrors.Collector
 }
 
 type ValidateRequest struct {
@@ -100,13 +101,28 @@ func (w *JobWorker) processPendingJob(ctx context.Context) error {
 		return nil
 	}
 
-	if job.FilePath == "" {
-		return w.failJob(job.ID, "job has no uploaded file path")
+	// Read records from either mixed sources or a single uploaded file.
+	var records []ingestion.RawRecord
+
+	if job.SourceType == "mixed" {
+		records, err = ingestion.ReadSources(
+			ctx,
+			job.SourceConfig.Sources,
+			w.HTTPClient,
+		)
+	} else {
+		if strings.TrimSpace(job.FilePath) == "" {
+			return w.failJob(job.ID, "job has no uploaded file path")
+		}
+
+		records, err = ingestion.ReadFile(job.FilePath)
 	}
 
-	// Read records from the uploaded CSV or JSON file.
-	records, err := ingestion.ReadFile(job.FilePath)
 	if err != nil {
+		if ctx.Err() != nil {
+			return w.failJob(job.ID, ctx.Err().Error())
+		}
+
 		return w.failJob(job.ID, err.Error())
 	}
 
@@ -125,7 +141,7 @@ func (w *JobWorker) processPendingJob(ctx context.Context) error {
 	}
 
 	if len(requestRecords) == 0 {
-		return w.failJob(job.ID, "uploaded file contains no records")
+		return w.failJob(job.ID, "input sources contain no records")
 	}
 
 	// Send records to the validation service.
@@ -138,6 +154,7 @@ func (w *JobWorker) processPendingJob(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return w.failJob(job.ID, ctx.Err().Error())
 		}
+
 		return w.failJob(job.ID, err.Error())
 	}
 
@@ -173,17 +190,20 @@ func (w *JobWorker) processPendingJob(ctx context.Context) error {
 
 	errorMessage := strings.Join(errorMessages, "; ")
 
-	// Convert each validation result into a database model.
-	jobRecords := make([]models.JobRecord, 0, len(validationResponse.Results))
+	// Convert validation results into database models.
+	jobRecords := make(
+		[]models.JobRecord,
+		0,
+		len(validationResponse.Results),
+	)
 
-	for i := 0; i < len(validationResponse.Results); i++ {
-		result := validationResponse.Results[i]
-	
+	for _, result := range validationResponse.Results {
 		validationErrors := result.Errors
+
 		if validationErrors == nil {
 			validationErrors = []string{}
 		}
-	
+
 		jobRecords = append(jobRecords, models.JobRecord{
 			JobID:            job.ID,
 			RecordNumber:     result.RecordNumber,
@@ -192,15 +212,19 @@ func (w *JobWorker) processPendingJob(ctx context.Context) error {
 			ValidationErrors: validationErrors,
 		})
 	}
+
 	if err := ctx.Err(); err != nil {
 		return w.failJob(job.ID, err.Error())
 	}
 
-	// Save the records and job summary in one transaction.
+	// Save validation results and the job summary atomically.
 	err = w.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if len(jobRecords) > 0 {
 			if err := tx.CreateInBatches(&jobRecords, 500).Error; err != nil {
-				return fmt.Errorf("save validation results: %w", err)
+				return fmt.Errorf(
+					"save validation results: %w",
+					err,
+				)
 			}
 		}
 
@@ -230,7 +254,11 @@ func (w *JobWorker) processPendingJob(ctx context.Context) error {
 	})
 
 	if err != nil {
-		return fmt.Errorf("persist job %d validation results: %w", job.ID, err)
+		return fmt.Errorf(
+			"persist job %d validation results: %w",
+			job.ID,
+			err,
+		)
 	}
 
 	log.Printf(
@@ -244,16 +272,18 @@ func (w *JobWorker) processPendingJob(ctx context.Context) error {
 	return nil
 }
 
-// validateRecords sends a batch of records to the validation service.
+// validateRecords sends records to the validation service.
 func (w *JobWorker) validateRecords(
 	ctx context.Context,
 	jobID uint,
 	records []map[string]string,
 ) (*ValidateResponse, error) {
 	validationURL := os.Getenv("VALIDATION_SERVICE_URL")
+
 	if validationURL == "" {
 		validationURL = "http://localhost:8081"
 	}
+
 	validationURL = strings.TrimRight(validationURL, "/") + "/validate"
 
 	requestBody := ValidateRequest{
@@ -263,7 +293,10 @@ func (w *JobWorker) validateRecords(
 
 	jsonBody, err := json.Marshal(requestBody)
 	if err != nil {
-		return nil, fmt.Errorf("encode validation request: %w", err)
+		return nil, fmt.Errorf(
+			"encode validation request: %w",
+			err,
+		)
 	}
 
 	req, err := http.NewRequestWithContext(
@@ -273,24 +306,36 @@ func (w *JobWorker) validateRecords(
 		bytes.NewReader(jsonBody),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("create validation request: %w", err)
+		return nil, fmt.Errorf(
+			"create validation request: %w",
+			err,
+		)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
 
 	client := w.HTTPClient
+
 	if client == nil {
-		client = &http.Client{Timeout: 35 * time.Second}
+		client = &http.Client{
+			Timeout: 35 * time.Second,
+		}
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("call validation service: %w", err)
+		return nil, fmt.Errorf(
+			"call validation service: %w",
+			err,
+		)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		body, _ := io.ReadAll(
+			io.LimitReader(resp.Body, 4096),
+		)
+
 		return nil, fmt.Errorf(
 			"validation service returned HTTP %d: %s",
 			resp.StatusCode,
@@ -301,7 +346,10 @@ func (w *JobWorker) validateRecords(
 	var response ValidateResponse
 
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-		return nil, fmt.Errorf("decode validation response: %w", err)
+		return nil, fmt.Errorf(
+			"decode validation response: %w",
+			err,
+		)
 	}
 
 	if response.JobID != jobID {
@@ -320,11 +368,39 @@ func nullableMessage(message string) interface{} {
 	if message == "" {
 		return nil
 	}
+
 	return message
 }
 
 // failJob marks a job as failed.
+// failJob records the pipeline error and marks the job as failed.
 func (w *JobWorker) failJob(jobID uint, message string) error {
+	if w.ErrorCollector != nil {
+		reportCtx, cancel := context.WithTimeout(
+			context.Background(),
+			2*time.Second,
+		)
+
+		err := w.ErrorCollector.Report(
+			reportCtx,
+			pipelineerrors.ErrorEvent{
+				JobID:   jobID,
+				Stage:   "ingestion",
+				Message: message,
+			},
+		)
+
+		cancel()
+
+		if err != nil {
+			log.Printf(
+				"failed to report pipeline error for job %d: %v",
+				jobID,
+				err,
+			)
+		}
+	}
+
 	return w.DB.Model(&models.Job{}).
 		Where("id = ?", jobID).
 		Updates(map[string]interface{}{

@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	pipelineerrors "go-assignment/packages/errors"
 	sharedDB "go-assignment/packages/database"
 )
 
@@ -21,18 +22,27 @@ func main() {
 		log.Fatalf("failed to connect to database: %v", err)
 	}
 
-	// Create a context that is cancelled on shutdown signals.
+	// Create a context cancelled by shutdown signals.
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
 		syscall.SIGTERM,
 	)
-	defer stop()
+
+	// Initialize and start the error collector.
+	collector := pipelineerrors.NewCollector(db, 100)
+	collectorCtx, cancelCollector := context.WithCancel(
+		context.Background(),
+	)
+
+	go collector.Run(collectorCtx)
 
 	// Start the background transformation worker.
 	worker := &TransformationWorker{
-		DB: db,
+		DB:             db,
+		ErrorCollector: collector,
 	}
+
 	go worker.Run(ctx)
 
 	// Configure the HTTP server.
@@ -50,7 +60,6 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	// Start the HTTP server in a goroutine.
 	serverErrors := make(chan error, 1)
 
 	go func() {
@@ -58,7 +67,7 @@ func main() {
 		serverErrors <- server.ListenAndServe()
 	}()
 
-	// Wait for shutdown or a server error.
+	// Wait for a shutdown signal or a server error.
 	select {
 	case <-ctx.Done():
 		log.Println("shutdown signal received")
@@ -70,12 +79,11 @@ func main() {
 		stop()
 	}
 
-	// Allow active HTTP requests to finish.
+	// Stop accepting requests and allow active requests to finish.
 	shutdownCtx, cancel := context.WithTimeout(
 		context.Background(),
 		10*time.Second,
 	)
-	defer cancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("graceful shutdown failed: %v", err)
@@ -84,6 +92,29 @@ func main() {
 			log.Printf("server close failed: %v", closeErr)
 		}
 	}
+	cancel()
+
+	// Stop the worker before shutting down the collector.
+	stop()
+
+	// Close the channel so the collector can drain queued events.
+	collector.Close()
+
+	drained := make(chan struct{})
+	go func() {
+		collector.Wait()
+		close(drained)
+	}()
+
+	select {
+	case <-drained:
+		log.Println("Pipeline error collector drained")
+	case <-time.After(10 * time.Second):
+		log.Println("Timed out waiting for error collector")
+	}
+
+	cancelCollector()
+	stop()
 
 	log.Println("transformation service stopped")
 }

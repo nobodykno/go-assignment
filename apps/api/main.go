@@ -13,12 +13,14 @@ import (
 	"go-assignment/apps/api/middleware"
 	"go-assignment/apps/api/route"
 	sharedDB "go-assignment/packages/database"
+	"go-assignment/packages/progress"
 
 	"github.com/joho/godotenv"
 )
 
 func main() {
 	// Load environment variables.
+	// Existing environment variables take precedence over .env values.
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found; using environment variables")
 	}
@@ -41,6 +43,14 @@ func main() {
 	)
 	defer stop()
 
+	// Start the background progress tracker.
+	tracker := &progress.Tracker{
+		DB:       db,
+		Interval: 5 * time.Second,
+	}
+
+	go tracker.Run(ctx)
+
 	// Register API routes and dependencies.
 	v1Router := route.NewRouter(db)
 
@@ -53,11 +63,19 @@ func main() {
 	)
 	mux.Handle("/v1/", v1Handler)
 
-	// Configure the HTTP server.
+	// Configure the API port.
+	port := os.Getenv("API_PORT")
+	if port == "" {
+		port = "8080"
+	}
+
 	server := &http.Server{
-		Addr:              ":8080",
+		Addr:              ":" + port,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	// Shut down the server gracefully when a signal arrives.
@@ -73,10 +91,14 @@ func main() {
 
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			log.Printf("HTTP server shutdown error: %v", err)
+
+			if err := server.Close(); err != nil {
+				log.Printf("Force close HTTP server: %v", err)
+			}
 		}
 	}()
 
-	log.Println("API server listening on :8080")
+	log.Printf("API server listening on :%s", port)
 
 	if err := server.ListenAndServe(); err != nil &&
 		err != http.ErrServerClosed {

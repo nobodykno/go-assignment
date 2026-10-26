@@ -1,3 +1,4 @@
+
 package main
 
 import (
@@ -7,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -17,15 +19,33 @@ func main() {
 		port = "8081"
 	}
 
+	// Configure the validation worker count.
+	workerCount := 5
+
+	if value := os.Getenv("VALIDATION_WORKERS"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed <= 0 {
+			log.Printf(
+				"Invalid VALIDATION_WORKERS value %q; using default %d",
+				value,
+				workerCount,
+			)
+		} else {
+			workerCount = parsed
+		}
+	}
+
+	// Configure the HTTP server.
 	server := &http.Server{
 		Addr:              ":" + port,
-		Handler:           NewHandler(4),
+		Handler:           NewHandler(workerCount),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 
+	// Handle graceful shutdown on interrupt or termination.
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
@@ -44,10 +64,18 @@ func main() {
 
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			log.Printf("HTTP server shutdown error: %v", err)
+
+			if closeErr := server.Close(); closeErr != nil {
+				log.Printf("HTTP server force-close error: %v", closeErr)
+			}
 		}
 	}()
 
-	log.Printf("Validation service listening on :%s", port)
+	log.Printf(
+		"Validation service listening on :%s with %d workers",
+		port,
+		workerCount,
+	)
 
 	err := server.ListenAndServe()
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {

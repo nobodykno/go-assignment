@@ -1,3 +1,4 @@
+
 package main
 
 import (
@@ -13,9 +14,9 @@ type RecordJob struct {
 
 // ValidationResult contains the record and its validation errors.
 type ValidationResult struct {
-    RecordNumber int      `json:"record_number"`
-    Record       Record   `json:"record"`
-    Errors       []string `json:"errors"`
+	RecordNumber int      `json:"record_number"`
+	Record       Record   `json:"record"`
+	Errors       []string `json:"errors"`
 }
 
 // WorkerPool validates records concurrently.
@@ -30,7 +31,6 @@ func (p *WorkerPool) Run(
 	output chan<- ValidationResult,
 ) {
 	workerCount := p.WorkerCount
-
 	if workerCount <= 0 {
 		workerCount = 1
 	}
@@ -44,6 +44,11 @@ func (p *WorkerPool) Run(
 			defer wg.Done()
 
 			for {
+				// Stop before receiving another record if cancelled.
+				if ctx.Err() != nil {
+					return
+				}
+
 				select {
 				case <-ctx.Done():
 					return
@@ -53,6 +58,7 @@ func (p *WorkerPool) Run(
 						return
 					}
 
+					// Avoid processing a record after cancellation.
 					if ctx.Err() != nil {
 						return
 					}
@@ -72,6 +78,7 @@ func (p *WorkerPool) Run(
 		}()
 	}
 
+	// Wait for all workers before closing output.
 	wg.Wait()
 	close(output)
 }
