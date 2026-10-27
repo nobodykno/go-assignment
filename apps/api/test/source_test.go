@@ -1,4 +1,3 @@
-
 package test
 
 import (
@@ -291,8 +290,8 @@ func TestSourceCreateJobSuccess(t *testing.T) {
 	}
 
 	var result struct {
-		Message string       `json:"message"`
-		Job      models.Job  `json:"job"`
+		Message string     `json:"message"`
+		Job     models.Job `json:"job"`
 	}
 
 	if err := json.NewDecoder(recorder.Body).Decode(&result); err != nil {
@@ -353,8 +352,8 @@ func TestSourceUploadFilesSuccess(t *testing.T) {
 	}
 
 	var result struct {
-		Message string                   `json:"message"`
-		Job     models.Job               `json:"job"`
+		Message string                    `json:"message"`
+		Job     models.Job                `json:"job"`
 		Sources []models.SourceDefinition `json:"sources"`
 	}
 

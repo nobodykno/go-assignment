@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -8,36 +7,41 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
-    pipelineerrors "go-assignment/packages/errors"
+
+	pipelineerrors "go-assignment/packages/errors"
+	"go-assignment/packages/jobs"
 	"go-assignment/packages/models"
 
 	"gorm.io/gorm"
 )
 
 type AggregationWorker struct {
-	DB *gorm.DB
+	DB             *gorm.DB
 	ErrorCollector *pipelineerrors.Collector
 }
 
+const aggregationPollInterval = 2 * time.Second
+const aggregationCleanupTimeout = 5 * time.Second
+
 // Run continuously checks for transformed jobs until cancelled.
 func (w *AggregationWorker) Run(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(aggregationPollInterval)
 	defer ticker.Stop()
 
 	log.Println("Aggregation worker started")
+	defer log.Println("Aggregation worker stopped")
 
 	for {
-		if err := ctx.Err(); err != nil {
-			log.Println("Aggregation worker stopped")
+		if ctx.Err() != nil {
 			return
 		}
 
 		if err := w.processPendingJob(ctx); err != nil {
-			if (errors.Is(err, context.Canceled) ||
-				errors.Is(err, context.DeadlineExceeded)) &&
-				ctx.Err() != nil {
-				log.Println("Aggregation worker stopped")
+			if ctx.Err() != nil &&
+				(errors.Is(err, context.Canceled) ||
+					errors.Is(err, context.DeadlineExceeded)) {
 				return
 			}
 
@@ -46,7 +50,6 @@ func (w *AggregationWorker) Run(ctx context.Context) {
 
 		select {
 		case <-ctx.Done():
-			log.Println("Aggregation worker stopped")
 			return
 		case <-ticker.C:
 		}
@@ -54,11 +57,13 @@ func (w *AggregationWorker) Run(ctx context.Context) {
 }
 
 // processPendingJob claims and aggregates the oldest transformed job.
-func (w *AggregationWorker) processPendingJob(
-	ctx context.Context,
-) error {
+func (w *AggregationWorker) processPendingJob(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+
+	if w.DB == nil {
+		return errors.New("aggregation worker database is not configured")
 	}
 
 	var job models.Job
@@ -76,11 +81,16 @@ func (w *AggregationWorker) processPendingJob(
 		return fmt.Errorf("find transformed job: %w", err)
 	}
 
-	// Atomically claim the job so only one worker can process it.
+	// Atomically claim the job. Only the worker that changes the status
+	// from transformed to aggregating is allowed to process it.
 	claim := w.DB.WithContext(ctx).
 		Model(&models.Job{}).
 		Where("id = ? AND status = ?", job.ID, "transformed").
-		Update("status", "aggregating")
+		Updates(map[string]interface{}{
+			"status":        "aggregating",
+			"error_message": nil,
+			"heartbeat_at":  time.Now().UTC(),
+		})
 
 	if claim.Error != nil {
 		return fmt.Errorf("claim job %d: %w", job.ID, claim.Error)
@@ -92,16 +102,27 @@ func (w *AggregationWorker) processPendingJob(
 
 	log.Printf("Started aggregation for job %d", job.ID)
 
-	// Validate the input after claiming so failJob can update its status.
-	if job.TransformedFilePath == "" {
-		return w.failJob(
-			ctx,
-			job.ID,
-			"transformed file path is empty",
-		)
+	// Refresh the heartbeat while the job remains in aggregating status.
+	stopHeartbeat := jobs.StartHeartbeat(
+		ctx,
+		w.DB,
+		job.ID,
+		"aggregating",
+		jobs.DefaultHeartbeatInterval,
+	)
+	defer stopHeartbeat()
+
+	if err := ctx.Err(); err != nil {
+		return w.failJob(ctx, job.ID, err.Error())
 	}
 
-	info, err := os.Stat(job.TransformedFilePath)
+	inputPath := strings.TrimSpace(job.TransformedFilePath)
+	if inputPath == "" {
+		return w.failJob(ctx, job.ID, "transformed file path is empty")
+	}
+
+	// Reject symbolic links and non-regular input files.
+	inputInfo, err := os.Lstat(inputPath)
 	if err != nil {
 		return w.failJob(
 			ctx,
@@ -110,7 +131,15 @@ func (w *AggregationWorker) processPendingJob(
 		)
 	}
 
-	if !info.Mode().IsRegular() {
+	if inputInfo.Mode()&os.ModeSymlink != 0 {
+		return w.failJob(
+			ctx,
+			job.ID,
+			"transformed input must not be a symbolic link",
+		)
+	}
+
+	if !inputInfo.Mode().IsRegular() {
 		return w.failJob(
 			ctx,
 			job.ID,
@@ -118,11 +147,7 @@ func (w *AggregationWorker) processPendingJob(
 		)
 	}
 
-	if err := ctx.Err(); err != nil {
-		return w.failJob(ctx, job.ID, err.Error())
-	}
-
-	outputDir := os.Getenv("AGGREGATED_OUTPUT_DIR")
+	outputDir := strings.TrimSpace(os.Getenv("AGGREGATED_OUTPUT_DIR"))
 	if outputDir == "" {
 		outputDir = "./output"
 	}
@@ -140,11 +165,49 @@ func (w *AggregationWorker) processPendingJob(
 		fmt.Sprintf("job-%d-aggregated.json", job.ID),
 	)
 
-	// AggregateFile reads the transformed JSON and writes aggregated JSON.
-	if err := AggregateFile(
-		job.TransformedFilePath,
-		outputPath,
-	); err != nil {
+	// Use a unique temporary file so interrupted attempts do not expose
+	// partially generated aggregation output.
+	tempFile, err := os.CreateTemp(
+		outputDir,
+		fmt.Sprintf("job-%d-aggregated-*.tmp", job.ID),
+	)
+	if err != nil {
+		return w.failJob(
+			ctx,
+			job.ID,
+			fmt.Sprintf("create temporary aggregation output: %v", err),
+		)
+	}
+
+	tempOutputPath := tempFile.Name()
+
+	if err := tempFile.Close(); err != nil {
+		_ = os.Remove(tempOutputPath)
+		return w.failJob(
+			ctx,
+			job.ID,
+			fmt.Sprintf("close temporary aggregation output: %v", err),
+		)
+	}
+
+	defer func() {
+		if err := os.Remove(tempOutputPath); err != nil &&
+			!errors.Is(err, os.ErrNotExist) {
+			log.Printf(
+				"Failed to remove temporary aggregation output for job %d: %v",
+				job.ID,
+				err,
+			)
+		}
+	}()
+
+	if err := ctx.Err(); err != nil {
+		return w.failJob(ctx, job.ID, err.Error())
+	}
+
+	// AggregateFile currently has no context parameter, so cancellation
+	// cannot interrupt the aggregation operation itself.
+	if err := AggregateFile(inputPath, tempOutputPath); err != nil {
 		return w.failJob(
 			ctx,
 			job.ID,
@@ -156,7 +219,42 @@ func (w *AggregationWorker) processPendingJob(
 		return w.failJob(ctx, job.ID, err.Error())
 	}
 
-	// Save the output path and advance to the export stage.
+	// Verify the generated output before publishing it.
+	outputInfo, err := os.Lstat(tempOutputPath)
+	if err != nil {
+		return w.failJob(
+			ctx,
+			job.ID,
+			fmt.Sprintf("inspect aggregation output: %v", err),
+		)
+	}
+
+	if outputInfo.Mode()&os.ModeSymlink != 0 ||
+		!outputInfo.Mode().IsRegular() {
+		return w.failJob(
+			ctx,
+			job.ID,
+			"aggregation output is not a regular file",
+		)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return w.failJob(ctx, job.ID, err.Error())
+	}
+
+	// Publish the completed output. The temporary file is in the same
+	// directory as the final file, allowing a same-filesystem rename.
+	if err := os.Rename(tempOutputPath, outputPath); err != nil {
+		return w.failJob(
+			ctx,
+			job.ID,
+			fmt.Sprintf("publish aggregation output: %v", err),
+		)
+	}
+
+	// Persist the output path and advance the job to the export stage.
+	// The status condition prevents overwriting a job owned by another
+	// process or already moved to another stage.
 	update := w.DB.WithContext(ctx).
 		Model(&models.Job{}).
 		Where("id = ? AND status = ?", job.ID, "aggregating").
@@ -164,6 +262,7 @@ func (w *AggregationWorker) processPendingJob(
 			"status":               "aggregated",
 			"aggregated_file_path": outputPath,
 			"error_message":        nil,
+			"heartbeat_at":         nil,
 		})
 
 	if update.Error != nil {
@@ -191,9 +290,9 @@ func (w *AggregationWorker) processPendingJob(
 	return nil
 }
 
-// failJob marks a currently aggregating job as failed.
-// A bounded cleanup context permits the DB update after cancellation.
-
+// failJob reports the error and marks the currently aggregating job
+// as failed. A bounded cleanup context allows the DB update to proceed
+// even if the worker's original context has been cancelled.
 func (w *AggregationWorker) failJob(
 	ctx context.Context,
 	jobID uint,
@@ -201,11 +300,10 @@ func (w *AggregationWorker) failJob(
 ) error {
 	cleanupCtx, cancel := context.WithTimeout(
 		context.WithoutCancel(ctx),
-		5*time.Second,
+		aggregationCleanupTimeout,
 	)
 	defer cancel()
 
-	// Report the aggregation-stage error.
 	if w.ErrorCollector != nil {
 		err := w.ErrorCollector.Report(
 			cleanupCtx,
@@ -225,13 +323,21 @@ func (w *AggregationWorker) failJob(
 		}
 	}
 
-	// Preserve the existing job failure update.
+	if w.DB == nil {
+		return fmt.Errorf(
+			"job %d failed (%s); database is not configured",
+			jobID,
+			message,
+		)
+	}
+
 	result := w.DB.WithContext(cleanupCtx).
 		Model(&models.Job{}).
 		Where("id = ? AND status = ?", jobID, "aggregating").
 		Updates(map[string]interface{}{
 			"status":        "failed",
 			"error_message": message,
+			"heartbeat_at":  nil,
 		})
 
 	if result.Error != nil {
@@ -245,7 +351,7 @@ func (w *AggregationWorker) failJob(
 
 	if result.RowsAffected == 0 {
 		return fmt.Errorf(
-			"job %d could not be marked failed: %s",
+			"job %d could not be marked failed because it is no longer aggregating: %s",
 			jobID,
 			message,
 		)

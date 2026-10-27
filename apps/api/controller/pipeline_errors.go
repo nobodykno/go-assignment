@@ -1,4 +1,3 @@
-
 package controller
 
 import (
@@ -17,8 +16,8 @@ type PipelineErrorsController struct {
 }
 
 type PipelineErrorsResponse struct {
-	JobID  uint                    `json:"job_id"`
-	Count  int                     `json:"count"`
+	JobID  uint                   `json:"job_id"`
+	Count  int                    `json:"count"`
 	Errors []models.PipelineError `json:"errors"`
 }
 

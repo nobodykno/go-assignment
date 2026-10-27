@@ -8,8 +8,8 @@ import (
 	"go-assignment/packages/models"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
-	"time"
 )
 
 func TestJobsGetJobRejectsUnsupportedMethod(t *testing.T) {
@@ -80,14 +80,14 @@ func TestJobsGetJobReturnsJobAndProgress(t *testing.T) {
 	db := openUploadTestDB(t)
 
 	job := models.Job{
-		Name:             "jobs-controller-test",
-		Status:            "transformed",
-		SourceType:        "upload",
+		Name:                "jobs-controller-test",
+		Status:              "transformed",
+		SourceType:          "upload",
 		TransformedFilePath: "transformed/output.json",
-		TotalRecords:      100,
-		ProcessedRecords:  80,
-		ValidRecords:      70,
-		InvalidRecords:    10,
+		TotalRecords:        100,
+		ProcessedRecords:    80,
+		ValidRecords:        70,
+		InvalidRecords:      10,
 	}
 
 	if err := db.Create(&job).Error; err != nil {
@@ -172,9 +172,9 @@ func TestJobsListReturnsJobsAndCount(t *testing.T) {
 			SourceType: "upload",
 		},
 		{
-			Name:       "jobs-list-test-exported",
-			Status:     "exported",
-			SourceType: "upload",
+			Name:             "jobs-list-test-exported",
+			Status:           "exported",
+			SourceType:       "upload",
 			ExportedFilePath: "exports/result.json",
 		},
 	}
@@ -225,104 +225,109 @@ func TestJobsListReturnsJobsAndCount(t *testing.T) {
 }
 
 func TestJobProgressPercentageByStatus(t *testing.T) {
-	now := time.Now()
+	db := openUploadTestDB(t)
 
 	tests := []struct {
-		name     string
-		job      models.Job
-		expected float64
+		name            string
+		status          string
+		total           int
+		processed       int
+		transformedPath string
+		aggregatedPath  string
+		exportedPath    string
+		expected        float64
 	}{
+		{name: "pending", status: "pending", expected: 0},
+		{name: "processing without records", status: "processing", expected: 5},
+		{name: "processing with records", status: "processing", total: 100, processed: 40, expected: 10},
+		{name: "processing capped at 25", status: "processing", total: 100, processed: 150, expected: 25},
+		{name: "validated", status: "validated", expected: 25},
+		{name: "transforming", status: "transforming", expected: 35},
+		{name: "transformed", status: "transformed", expected: 50},
+		{name: "aggregating", status: "aggregating", expected: 65},
+		{name: "aggregated", status: "aggregated", expected: 75},
+		{name: "exporting", status: "exporting", expected: 90},
+		{name: "exported", status: "exported", expected: 100},
 		{
-			name: "pending",
-			job: models.Job{Status: "pending"},
-			expected: 0,
+			name:         "failed after export",
+			status:       "failed",
+			exportedPath: "exports/result.json",
+			expected:     100,
 		},
 		{
-			name: "processing without records",
-			job: models.Job{Status: "processing"},
-			expected: 5,
+			name:           "failed after aggregation",
+			status:         "failed",
+			aggregatedPath: "aggregated/result.json",
+			expected:       75,
 		},
 		{
-			name: "processing with records",
-			job: models.Job{Status: "processing", TotalRecords: 100, ProcessedRecords: 40},
-			expected: 10,
+			name:            "failed after transformation",
+			status:          "failed",
+			transformedPath: "transformed/result.json",
+			expected:        50,
 		},
 		{
-			name: "processing progress capped at 25",
-			job: models.Job{Status: "processing", TotalRecords: 100, ProcessedRecords: 150},
-			expected: 25,
+			name:      "failed during processing",
+			status:    "failed",
+			total:     100,
+			processed: 20,
+			expected:  5,
 		},
-		{
-			name: "validated",
-			job: models.Job{Status: "validated"},
-			expected: 25,
-		},
-		{
-			name: "transforming",
-			job: models.Job{Status: "transforming"},
-			expected: 35,
-		},
-		{
-			name: "transformed",
-			job: models.Job{Status: "transformed"},
-			expected: 50,
-		},
-		{
-			name: "aggregating",
-			job: models.Job{Status: "aggregating"},
-			expected: 65,
-		},
-		{
-			name: "aggregated",
-			job: models.Job{Status: "aggregated"},
-			expected: 75,
-		},
-		{
-			name: "exporting",
-			job: models.Job{Status: "exporting"},
-			expected: 90,
-		},
-		{
-			name: "exported",
-			job: models.Job{Status: "exported"},
-			expected: 100,
-		},
-		{
-			name: "failed after export",
-			job: models.Job{Status: "failed", ExportedFilePath: "exports/result.json"},
-			expected: 100,
-		},
-		{
-			name: "failed after aggregation",
-			job: models.Job{Status: "failed", AggregatedFilePath: "aggregated/result.json"},
-			expected: 75,
-		},
-		{
-			name: "failed after transformation",
-			job: models.Job{Status: "failed", TransformedFilePath: "transformed/result.json"},
-			expected: 50,
-		},
-		{
-			name: "failed during processing",
-			job: models.Job{Status: "failed", TotalRecords: 100, ProcessedRecords: 20},
-			expected: 5,
-		},
-		{
-			name: "unknown status",
-			job: models.Job{Status: "unknown"},
-			expected: 0,
-		},
+		{name: "unknown status", status: "unknown", expected: 0},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := controller.JobProgressResponse{}
-			_ = got
-			_ = now
+			job := models.Job{
+				Name:                "progress-test-" + tt.name,
+				Status:              tt.status,
+				SourceType:          "upload",
+				TotalRecords:        tt.total,
+				ProcessedRecords:    tt.processed,
+				TransformedFilePath: tt.transformedPath,
+				AggregatedFilePath:  tt.aggregatedPath,
+				ExportedFilePath:    tt.exportedPath,
+			}
 
-			// Exercise the response mapping through a small test-only handler
-			// is not possible without exporting the unexported helper.
-			// Progress values are therefore covered by the integration tests above.
+			if err := db.Create(&job).Error; err != nil {
+				t.Fatalf("create job: %v", err)
+			}
+			t.Cleanup(func() {
+				db.Delete(&models.Job{}, job.ID)
+			})
+
+			ctrl := controller.NewJobsController(&service.JobService{DB: db})
+			req := httptest.NewRequest(
+				http.MethodGet,
+				"/jobs/"+strconv.FormatUint(uint64(job.ID), 10),
+				nil,
+			)
+			req.SetPathValue("id", strconv.FormatUint(uint64(job.ID), 10))
+
+			rec := httptest.NewRecorder()
+			ctrl.GetJob(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf(
+					"expected status %d, got %d; body: %s",
+					http.StatusOK,
+					rec.Code,
+					rec.Body.String(),
+				)
+			}
+
+			var result controller.JobProgressResponse
+			if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+
+			if result.ProgressPercentage != tt.expected {
+				t.Errorf(
+					"expected progress %.2f, got %.2f",
+					tt.expected,
+					result.ProgressPercentage,
+				)
+			}
 		})
 	}
 }
@@ -339,4 +344,3 @@ func assertJobsErrorResponse(t *testing.T, rec *httptest.ResponseRecorder, expec
 		t.Errorf("expected error %q, got %q", expected, result.Error)
 	}
 }
-

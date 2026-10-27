@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -14,15 +13,15 @@ import (
 
 // TransformedRecord matches the generic transformation output.
 type TransformedRecord struct {
-	Source     string             `json:"source"`
-	Date       string             `json:"date"`
-	Dimensions map[string]string  `json:"dimensions"`
-	Metrics    map[string]float64 `json:"metrics"`
+	Source           string             `json:"source"`
+	Date             string             `json:"date"`
+	Dimensions       map[string]string  `json:"dimensions"`
+	Metrics          map[string]float64 `json:"metrics"`
+	MetricOperations map[string]string  `json:"metric_operations,omitempty"`
 }
 
-// AggregatedRecord contains totals for records sharing a date, source,
-// and dimensions. Keeping Source in the grouping key prevents unrelated
-// datasets from being combined.
+// AggregatedRecord contains aggregated metrics for records sharing
+// the same date, source, and dimensions.
 type AggregatedRecord struct {
 	Source      string             `json:"source"`
 	Date        string             `json:"date"`
@@ -38,8 +37,8 @@ type aggregationKey struct {
 	Dimensions map[string]string `json:"dimensions"`
 }
 
-// AggregateRecords groups records by date, source, and dimensions,
-// then sums metrics within each group.
+// AggregateRecords groups records by date, source, and dimensions.
+// Each metric uses its configured aggregation operation.
 func AggregateRecords(
 	records []TransformedRecord,
 ) ([]AggregatedRecord, error) {
@@ -48,6 +47,8 @@ func AggregateRecords(
 	}
 
 	totals := make(map[string]*AggregatedRecord)
+	metricCounts := make(map[string]map[string]int)
+	operationsByGroup := make(map[string]map[string]string)
 
 	for index, record := range records {
 		date := strings.TrimSpace(record.Date)
@@ -72,8 +73,6 @@ func AggregateRecords(
 			record.Metrics = make(map[string]float64)
 		}
 
-		// JSON encoding provides a stable grouping key because
-		// encoding/json sorts string map keys.
 		keyBytes, err := json.Marshal(aggregationKey{
 			Source:     source,
 			Date:       date,
@@ -108,10 +107,14 @@ func AggregateRecords(
 			}
 
 			totals[key] = aggregate
+			metricCounts[key] = make(map[string]int)
+			operationsByGroup[key] = make(map[string]string)
 		}
 
 		for metricName, value := range record.Metrics {
-			metricName = strings.TrimSpace(metricName)
+			metricName = strings.ToLower(
+				strings.TrimSpace(metricName),
+			)
 
 			if metricName == "" {
 				return nil, fmt.Errorf(
@@ -128,17 +131,71 @@ func AggregateRecords(
 				)
 			}
 
-			sum := aggregate.Metrics[metricName] + value
-
-			if math.IsNaN(sum) || math.IsInf(sum, 0) {
-				return nil, fmt.Errorf(
-					"metric %q overflow while aggregating record %d",
-					metricName,
-					index+1,
+			operation := ""
+			if record.MetricOperations != nil {
+				operation = strings.ToLower(
+					strings.TrimSpace(
+						record.MetricOperations[metricName],
+					),
 				)
 			}
 
-			aggregate.Metrics[metricName] = sum
+			if operation == "" {
+				operation = aggregationOperationForMetric(metricName)
+			}
+
+			switch operation {
+			case "sum", "avg", "min", "max":
+			default:
+				return nil, fmt.Errorf(
+					"record %d has unsupported aggregation operation %q for metric %q",
+					index+1,
+					operation,
+					metricName,
+				)
+			}
+
+			existingOperation, alreadyConfigured :=
+				operationsByGroup[key][metricName]
+
+			if alreadyConfigured && existingOperation != operation {
+				return nil, fmt.Errorf(
+					"inconsistent aggregation operations for metric %q",
+					metricName,
+				)
+			}
+
+			operationsByGroup[key][metricName] = operation
+
+			count := metricCounts[key][metricName]
+			current := aggregate.Metrics[metricName]
+
+			switch operation {
+			case "sum", "avg":
+				next := current + value
+
+				if math.IsNaN(next) || math.IsInf(next, 0) {
+					return nil, fmt.Errorf(
+						"metric %q overflow while aggregating record %d",
+						metricName,
+						index+1,
+					)
+				}
+
+				aggregate.Metrics[metricName] = next
+
+			case "min":
+				if count == 0 || value < current {
+					aggregate.Metrics[metricName] = value
+				}
+
+			case "max":
+				if count == 0 || value > current {
+					aggregate.Metrics[metricName] = value
+				}
+			}
+
+			metricCounts[key][metricName] = count + 1
 		}
 
 		aggregate.RecordCount++
@@ -146,11 +203,27 @@ func AggregateRecords(
 
 	result := make([]AggregatedRecord, 0, len(totals))
 
-	for _, aggregate := range totals {
+	for key, aggregate := range totals {
+		for metricName, operation := range operationsByGroup[key] {
+			if operation != "avg" {
+				continue
+			}
+
+			count := metricCounts[key][metricName]
+			if count == 0 {
+				return nil, fmt.Errorf(
+					"cannot calculate average for metric %q without values",
+					metricName,
+				)
+			}
+
+			aggregate.Metrics[metricName] /= float64(count)
+		}
+
 		result = append(result, *aggregate)
 	}
 
-	// Sort by date, source, and a stable representation of dimensions.
+	// Sort by date, source, and dimensions for deterministic output.
 	sort.Slice(result, func(i, j int) bool {
 		if result[i].Date != result[j].Date {
 			return result[i].Date < result[j].Date
@@ -169,7 +242,28 @@ func AggregateRecords(
 	return result, nil
 }
 
-// AggregateFile reads transformed JSON, aggregates the records,
+// aggregationOperationForMetric provides defaults for transformed
+// files that do not contain explicit metric_operations.
+func aggregationOperationForMetric(key string) string {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "temperature_2m_max":
+		return "max"
+
+	case "temperature_2m_min":
+		return "min"
+
+	case "price_usd", "current_price":
+		return "avg"
+
+	case "cases", "deaths", "precipitation_sum":
+		return "sum"
+
+	default:
+		return "sum"
+	}
+}
+
+// AggregateFile reads transformed JSON, aggregates records,
 // and writes the result to a separate JSON file.
 func AggregateFile(
 	inputPath string,
@@ -189,7 +283,7 @@ func AggregateFile(
 		return fmt.Errorf("decode transformed records: %w", err)
 	}
 
-	// Ensure the file contains exactly one JSON value.
+	// Require exactly one JSON value in the input file.
 	var extra interface{}
 
 	if err := decoder.Decode(&extra); err != io.EOF {

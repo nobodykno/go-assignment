@@ -1,4 +1,3 @@
-
 package errors
 
 import (
@@ -25,7 +24,9 @@ type Collector struct {
 
 	mu      sync.RWMutex
 	closed  bool
+	done    chan struct{}
 	workers sync.WaitGroup
+	reports sync.WaitGroup
 }
 
 func NewCollector(db *gorm.DB, bufferSize int) *Collector {
@@ -36,6 +37,7 @@ func NewCollector(db *gorm.DB, bufferSize int) *Collector {
 	return &Collector{
 		DB:     db,
 		Events: make(chan ErrorEvent, bufferSize),
+		done:   make(chan struct{}),
 	}
 }
 
@@ -49,17 +51,20 @@ func (c *Collector) Run(ctx context.Context) {
 
 	for {
 		select {
-		case event, ok := <-c.Events:
-			if !ok {
-				return
-			}
-
+		case event := <-c.Events:
 			if err := c.persist(ctx, event); err != nil {
 				log.Printf("Failed to persist pipeline error: %v", err)
 			}
 
+		case <-c.done:
+			c.reports.Wait()
+			c.drain(ctx)
+			return
+
 		case <-ctx.Done():
-			// Process events already queued before exiting.
+			// Stop accepting reports and allow in-flight reports to exit.
+			c.Close()
+			c.reports.Wait()
 			c.drain(ctx)
 			return
 		}
@@ -83,29 +88,46 @@ func (c *Collector) Report(
 		return fmt.Errorf("error message is required")
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// Register the report while holding the read lock. Close() obtains
+	// the write lock, preventing new reports from registering afterward.
 	c.mu.RLock()
-	defer c.mu.RUnlock()
 
 	if c.closed {
+		c.mu.RUnlock()
 		return fmt.Errorf("error collector is closed")
 	}
+
+	c.reports.Add(1)
+	c.mu.RUnlock()
+
+	defer c.reports.Done()
 
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
+
+	case <-c.done:
+		return fmt.Errorf("error collector is closed")
+
 	case c.Events <- event:
 		return nil
 	}
 }
 
-// Close prevents further reports and closes the event channel.
+// Close prevents new reports and wakes blocked Report and Run calls.
+// Events remains open so concurrent reports cannot panic by sending
+// to a closed channel.
 func (c *Collector) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if !c.closed {
 		c.closed = true
-		close(c.Events)
+		close(c.done)
 	}
 }
 
@@ -114,17 +136,16 @@ func (c *Collector) Wait() {
 	c.workers.Wait()
 }
 
-// drain persists events already queued when the context is cancelled.
+// drain persists events already queued before shutdown.
 func (c *Collector) drain(ctx context.Context) {
 	for {
 		select {
-		case event, ok := <-c.Events:
-			if !ok {
-				return
-			}
-
+		case event := <-c.Events:
 			if err := c.persist(ctx, event); err != nil {
-				log.Printf("Failed to persist queued pipeline error: %v", err)
+				log.Printf(
+					"Failed to persist queued pipeline error: %v",
+					err,
+				)
 			}
 
 		default:
@@ -137,8 +158,8 @@ func (c *Collector) persist(
 	ctx context.Context,
 	event ErrorEvent,
 ) error {
-	// Allow a bounded database write even if the worker context
-	// has been cancelled during shutdown.
+	// Give database writes a bounded opportunity to finish even if
+	// the worker context was cancelled during shutdown.
 	persistCtx, cancel := context.WithTimeout(
 		context.WithoutCancel(ctx),
 		5*time.Second,

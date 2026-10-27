@@ -1,4 +1,3 @@
-
 package route
 
 import (
@@ -18,7 +17,6 @@ func RegisterSourceRoutes(
 		sourceController.CreateJob,
 	)
 
-	
 	router.HandleFunc(
 		"POST /jobs/mixed/upload",
 		sourceController.UploadFilesAndCreateJob,

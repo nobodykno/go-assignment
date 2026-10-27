@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -10,39 +9,43 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	pipelineerrors "go-assignment/packages/errors"
+	"go-assignment/packages/jobs"
 	"go-assignment/packages/models"
-     pipelineerrors "go-assignment/packages/errors"
+
 	"gorm.io/gorm"
 )
 
 type TransformationWorker struct {
-	DB *gorm.DB
+	DB             *gorm.DB
 	ErrorCollector *pipelineerrors.Collector
 }
 
+const transformationPollInterval = 2 * time.Second
+const transformationCleanupTimeout = 5 * time.Second
+
 // Run continuously checks for validated jobs until the context is cancelled.
 func (w *TransformationWorker) Run(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(transformationPollInterval)
 	defer ticker.Stop()
 
 	log.Println("Transformation worker started")
+	defer log.Println("Transformation worker stopped")
 
 	for {
 		if err := ctx.Err(); err != nil {
-			log.Println("Transformation worker stopped")
 			return
 		}
 
 		if err := w.processPendingJob(ctx); err != nil {
-			if errors.Is(err, context.Canceled) ||
-				errors.Is(err, context.DeadlineExceeded) {
-				if ctx.Err() != nil {
-					log.Println("Transformation worker stopped")
-					return
-				}
+			if ctx.Err() != nil &&
+				(errors.Is(err, context.Canceled) ||
+					errors.Is(err, context.DeadlineExceeded)) {
+				return
 			}
 
 			log.Printf("Transformation worker error: %v", err)
@@ -50,7 +53,6 @@ func (w *TransformationWorker) Run(ctx context.Context) {
 
 		select {
 		case <-ctx.Done():
-			log.Println("Transformation worker stopped")
 			return
 		case <-ticker.C:
 		}
@@ -61,6 +63,10 @@ func (w *TransformationWorker) Run(ctx context.Context) {
 func (w *TransformationWorker) processPendingJob(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+
+	if w.DB == nil {
+		return errors.New("transformation worker database is not configured")
 	}
 
 	var job models.Job
@@ -79,11 +85,15 @@ func (w *TransformationWorker) processPendingJob(ctx context.Context) error {
 	}
 
 	// Atomically claim the job so another service instance cannot
-	// claim the same job while its status is still validated.
+	// claim it while its status is still validated.
 	claim := w.DB.WithContext(ctx).
 		Model(&models.Job{}).
 		Where("id = ? AND status = ?", job.ID, "validated").
-		Update("status", "transforming")
+		Updates(map[string]interface{}{
+			"status":        "transforming",
+			"error_message": nil,
+			"heartbeat_at":  time.Now().UTC(),
+		})
 
 	if claim.Error != nil {
 		return fmt.Errorf("claim job %d: %w", job.ID, claim.Error)
@@ -94,6 +104,20 @@ func (w *TransformationWorker) processPendingJob(ctx context.Context) error {
 	}
 
 	log.Printf("Started transformation for job %d", job.ID)
+
+	// Keep the heartbeat fresh while this worker owns the job.
+	stopHeartbeat := jobs.StartHeartbeat(
+		ctx,
+		w.DB,
+		job.ID,
+		"transforming",
+		jobs.DefaultHeartbeatInterval,
+	)
+	defer stopHeartbeat()
+
+	if err := ctx.Err(); err != nil {
+		return w.failJob(ctx, job.ID, err.Error())
+	}
 
 	// Load only records that passed validation.
 	var records []models.JobRecord
@@ -146,13 +170,13 @@ func (w *TransformationWorker) processPendingJob(ctx context.Context) error {
 		err         error
 	}
 
-	jobs := make(chan int, len(records))
+	recordJobs := make(chan int, len(records))
 	results := make(chan transformResult, len(records))
 
 	for i := range records {
-		jobs <- i
+		recordJobs <- i
 	}
-	close(jobs)
+	close(recordJobs)
 
 	var wg sync.WaitGroup
 
@@ -172,7 +196,7 @@ func (w *TransformationWorker) processPendingJob(ctx context.Context) error {
 				case <-ctx.Done():
 					return
 
-				case index, ok := <-jobs:
+				case index, ok := <-recordJobs:
 					if !ok {
 						return
 					}
@@ -201,7 +225,7 @@ func (w *TransformationWorker) processPendingJob(ctx context.Context) error {
 		}()
 	}
 
-	// Close results only after all workers have finished.
+	// Close results only after every worker has finished.
 	go func() {
 		wg.Wait()
 		close(results)
@@ -301,7 +325,6 @@ func (w *TransformationWorker) processPendingJob(ctx context.Context) error {
 		return w.failJob(ctx, job.ID, err.Error())
 	}
 
-	// Do not continue the pipeline when no records were transformed.
 	if len(transformedRecords) == 0 {
 		return w.failJob(
 			ctx,
@@ -324,9 +347,7 @@ func (w *TransformationWorker) processPendingJob(ctx context.Context) error {
 	summaryUpdate := w.DB.WithContext(ctx).
 		Model(&models.Job{}).
 		Where("id = ? AND status = ?", job.ID, "transforming").
-		Updates(map[string]interface{}{
-			"error_message": errorSummary,
-		})
+		Update("error_message", errorSummary)
 
 	if summaryUpdate.Error != nil {
 		return w.failJob(
@@ -347,7 +368,7 @@ func (w *TransformationWorker) processPendingJob(ctx context.Context) error {
 	}
 
 	// Write transformed records to the configured output directory.
-	outputDir := os.Getenv("TRANSFORMED_OUTPUT_DIR")
+	outputDir := strings.TrimSpace(os.Getenv("TRANSFORMED_OUTPUT_DIR"))
 	if outputDir == "" {
 		outputDir = "./output"
 	}
@@ -365,8 +386,8 @@ func (w *TransformationWorker) processPendingJob(ctx context.Context) error {
 		fmt.Sprintf("job-%d-transformed.json", job.ID),
 	)
 
-	// Write to a temporary file so the final output is never
-	// exposed as partially written JSON.
+	// Write to a temporary file so the final output is not exposed
+	// while the JSON is being generated.
 	tempFile, err := os.CreateTemp(
 		outputDir,
 		fmt.Sprintf("job-%d-*.tmp", job.ID),
@@ -382,7 +403,14 @@ func (w *TransformationWorker) processPendingJob(ctx context.Context) error {
 	tempPath := tempFile.Name()
 
 	defer func() {
-		_ = os.Remove(tempPath)
+		if err := os.Remove(tempPath); err != nil &&
+			!errors.Is(err, os.ErrNotExist) {
+			log.Printf(
+				"Failed to remove temporary transformation output for job %d: %v",
+				job.ID,
+				err,
+			)
+		}
 	}()
 
 	encoder := json.NewEncoder(tempFile)
@@ -418,13 +446,18 @@ func (w *TransformationWorker) processPendingJob(ctx context.Context) error {
 		)
 	}
 
-	// Save the transformed status and output path.
+	if err := ctx.Err(); err != nil {
+		return w.failJob(ctx, job.ID, err.Error())
+	}
+
+	// Complete the stage and clear the heartbeat.
 	finalUpdate := w.DB.WithContext(ctx).
 		Model(&models.Job{}).
 		Where("id = ? AND status = ?", job.ID, "transforming").
 		Updates(map[string]interface{}{
 			"status":                "transformed",
 			"transformed_file_path": outputPath,
+			"heartbeat_at":          nil,
 		})
 
 	if finalUpdate.Error != nil {
@@ -454,11 +487,8 @@ func (w *TransformationWorker) processPendingJob(ctx context.Context) error {
 	return nil
 }
 
-// failJob marks a transforming job as failed.
-// A bounded cleanup context allows the failure status to be saved
-// even if the original processing context has been cancelled.
-
-
+// failJob marks a transforming job as failed and clears its heartbeat.
+// A bounded cleanup context permits the DB update after cancellation.
 func (w *TransformationWorker) failJob(
 	ctx context.Context,
 	jobID uint,
@@ -466,11 +496,10 @@ func (w *TransformationWorker) failJob(
 ) error {
 	cleanupCtx, cancel := context.WithTimeout(
 		context.WithoutCancel(ctx),
-		5*time.Second,
+		transformationCleanupTimeout,
 	)
 	defer cancel()
 
-	// Report the transformation-stage error to the collector.
 	if w.ErrorCollector != nil {
 		err := w.ErrorCollector.Report(
 			cleanupCtx,
@@ -490,18 +519,26 @@ func (w *TransformationWorker) failJob(
 		}
 	}
 
-	// Preserve the existing behavior: mark the job as failed.
+	if w.DB == nil {
+		return fmt.Errorf(
+			"job %d failed (%s); database is not configured",
+			jobID,
+			message,
+		)
+	}
+
 	result := w.DB.WithContext(cleanupCtx).
 		Model(&models.Job{}).
 		Where("id = ? AND status = ?", jobID, "transforming").
 		Updates(map[string]interface{}{
 			"status":        "failed",
 			"error_message": message,
+			"heartbeat_at":  nil,
 		})
 
 	if result.Error != nil {
 		return fmt.Errorf(
-			"job %d failed (%s); also failed to save failure status: %w",
+			"job %d failed (%s); unable to save failure status: %w",
 			jobID,
 			message,
 			result.Error,
@@ -510,7 +547,7 @@ func (w *TransformationWorker) failJob(
 
 	if result.RowsAffected == 0 {
 		return fmt.Errorf(
-			"job %d could not be marked failed; it may no longer be transforming: %s",
+			"job %d could not be marked failed because it is no longer transforming: %s",
 			jobID,
 			message,
 		)

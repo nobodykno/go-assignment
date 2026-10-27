@@ -1,4 +1,3 @@
-
 package ingestion
 
 import (
@@ -183,6 +182,10 @@ func readOneSource(
 		switch provider {
 		case "open-meteo":
 			records, err = ParseOpenMeteo(body)
+
+		case "coingecko":
+			records, err = ParseCoinGecko(body)
+
 		default:
 			records, err = parseAPIRecords(body)
 		}
@@ -213,8 +216,6 @@ func readOneSource(
 	return records, nil
 }
 
-// resolveSourceFile restricts source files to the configured uploads directory.
-// Set UPLOADS_DIR to the absolute uploads directory path in Docker.
 func resolveSourceFile(filePath string) (string, error) {
 	uploadsDir := strings.TrimSpace(os.Getenv("UPLOADS_DIR"))
 	if uploadsDir == "" {
@@ -293,8 +294,6 @@ func isWithinDirectory(basePath, candidate string) bool {
 		!filepath.IsAbs(relative)
 }
 
-// ReadAPI reads JSON records from an HTTPS API.
-// It supports a JSON array or an object containing a "data" array.
 func ReadAPI(
 	ctx context.Context,
 	client *http.Client,
@@ -442,9 +441,6 @@ func parseAPIRecords(body []byte) ([]RawRecord, error) {
 	return records, nil
 }
 
-// validatePublicHost rejects hostnames resolving to non-public IP addresses.
-// Production deployments should additionally use a hostname allowlist and
-// enforce destination checks at connection time to mitigate DNS rebinding.
 func validatePublicHost(ctx context.Context, hostname string) error {
 	if ip, err := netip.ParseAddr(hostname); err == nil {
 		if !isPublicIP(ip) {

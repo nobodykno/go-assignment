@@ -1,4 +1,3 @@
-
 package controller
 
 import (
@@ -132,7 +131,6 @@ func (c *JobsController) ListJobs(
 		Jobs:  responses,
 	})
 }
-
 
 func toJobProgressResponse(job *models.Job) JobProgressResponse {
 	var progress float64

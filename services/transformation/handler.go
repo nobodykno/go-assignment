@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -16,11 +15,11 @@ type TransformRequest struct {
 }
 
 type TransformResponse struct {
-	JobID          uint               `json:"job_id"`
-	TotalRecords   int                `json:"total_records"`
-	Transformed    int                `json:"transformed_records"`
-	Failed         int                `json:"failed_records"`
-	Results        []TransformResult  `json:"results"`
+	JobID        uint              `json:"job_id"`
+	TotalRecords int               `json:"total_records"`
+	Transformed  int               `json:"transformed_records"`
+	Failed       int               `json:"failed_records"`
+	Results      []TransformResult `json:"results"`
 }
 
 type TransformResult struct {

@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -9,9 +8,7 @@ import (
 	"time"
 )
 
-
 type Record map[string]string
-
 
 func ValidateRecord(record Record) []error {
 	var validationErrors []error

@@ -1,0 +1,17 @@
+
+#!/bin/sh
+set -eu
+
+echo "Running Go tests for all modules..."
+
+find apps packages services \
+  -name go.mod \
+  -not -path '*/vendor/*' \
+  -print |
+while IFS= read -r module_file; do
+    module_dir=$(dirname "$module_file")
+    echo "Testing $module_dir"
+    (cd "$module_dir" && go test ./...)
+done
+
+echo "All Go module tests passed."

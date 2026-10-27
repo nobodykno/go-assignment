@@ -1,13 +1,12 @@
-
 package controller
 
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
-"io"
-"os"
-"path/filepath"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"go-assignment/packages/models"
@@ -23,7 +22,6 @@ type CreateSourceJobRequest struct {
 	Name    string                    `json:"name"`
 	Sources []models.SourceDefinition `json:"sources"`
 }
-
 
 func (c *SourceController) UploadFilesAndCreateJob(
 	w http.ResponseWriter,
@@ -174,7 +172,6 @@ func (c *SourceController) UploadFilesAndCreateJob(
 	})
 }
 
-
 func (c *SourceController) CreateJob(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -262,4 +259,3 @@ func (c *SourceController) CreateJob(
 		"job":     job,
 	})
 }
-

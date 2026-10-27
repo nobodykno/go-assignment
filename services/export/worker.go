@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -8,38 +7,42 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
-	"go-assignment/packages/models"
 	pipelineerrors "go-assignment/packages/errors"
+	"go-assignment/packages/jobs"
+	"go-assignment/packages/models"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
 type ExportWorker struct {
-	DB *gorm.DB
+	DB             *gorm.DB
 	ErrorCollector *pipelineerrors.Collector
 }
 
+const exportPollInterval = 2 * time.Second
+const exportCleanupTimeout = 5 * time.Second
+
 // Run continuously checks for aggregated jobs until cancelled.
 func (w *ExportWorker) Run(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(exportPollInterval)
 	defer ticker.Stop()
 
 	log.Println("Export worker started")
+	defer log.Println("Export worker stopped")
 
 	for {
 		if err := ctx.Err(); err != nil {
-			log.Println("Export worker stopped")
 			return
 		}
 
 		if err := w.processPendingJob(ctx); err != nil {
-			if (errors.Is(err, context.Canceled) ||
-				errors.Is(err, context.DeadlineExceeded)) &&
-				ctx.Err() != nil {
-				log.Println("Export worker stopped")
+			if ctx.Err() != nil &&
+				(errors.Is(err, context.Canceled) ||
+					errors.Is(err, context.DeadlineExceeded)) {
 				return
 			}
 
@@ -48,7 +51,6 @@ func (w *ExportWorker) Run(ctx context.Context) {
 
 		select {
 		case <-ctx.Done():
-			log.Println("Export worker stopped")
 			return
 		case <-ticker.C:
 		}
@@ -59,6 +61,10 @@ func (w *ExportWorker) Run(ctx context.Context) {
 func (w *ExportWorker) processPendingJob(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+
+	if w.DB == nil {
+		return errors.New("export worker database is not configured")
 	}
 
 	var job models.Job
@@ -76,10 +82,15 @@ func (w *ExportWorker) processPendingJob(ctx context.Context) error {
 		return fmt.Errorf("find aggregated job: %w", err)
 	}
 
+	// Atomically claim the job so only one worker exports it.
 	claim := w.DB.WithContext(ctx).
 		Model(&models.Job{}).
 		Where("id = ? AND status = ?", job.ID, "aggregated").
-		Update("status", "exporting")
+		Updates(map[string]interface{}{
+			"status":        "exporting",
+			"error_message": nil,
+			"heartbeat_at":  time.Now().UTC(),
+		})
 
 	if claim.Error != nil {
 		return fmt.Errorf("claim job %d: %w", job.ID, claim.Error)
@@ -91,15 +102,27 @@ func (w *ExportWorker) processPendingJob(ctx context.Context) error {
 
 	log.Printf("Started export for job %d", job.ID)
 
-	if job.AggregatedFilePath == "" {
-		return w.failJob(
-			ctx,
-			job.ID,
-			"aggregated file path is empty",
-		)
+	// Keep heartbeat_at updated while this worker owns the job.
+	stopHeartbeat := jobs.StartHeartbeat(
+		ctx,
+		w.DB,
+		job.ID,
+		"exporting",
+		jobs.DefaultHeartbeatInterval,
+	)
+	defer stopHeartbeat()
+
+	if err := ctx.Err(); err != nil {
+		return w.failJob(ctx, job.ID, err.Error())
 	}
 
-	info, err := os.Stat(job.AggregatedFilePath)
+	inputPath := strings.TrimSpace(job.AggregatedFilePath)
+	if inputPath == "" {
+		return w.failJob(ctx, job.ID, "aggregated file path is empty")
+	}
+
+	// Reject symbolic links and non-regular input files.
+	inputInfo, err := os.Lstat(inputPath)
 	if err != nil {
 		return w.failJob(
 			ctx,
@@ -108,7 +131,15 @@ func (w *ExportWorker) processPendingJob(ctx context.Context) error {
 		)
 	}
 
-	if !info.Mode().IsRegular() {
+	if inputInfo.Mode()&os.ModeSymlink != 0 {
+		return w.failJob(
+			ctx,
+			job.ID,
+			"aggregated input must not be a symbolic link",
+		)
+	}
+
+	if !inputInfo.Mode().IsRegular() {
 		return w.failJob(
 			ctx,
 			job.ID,
@@ -116,11 +147,7 @@ func (w *ExportWorker) processPendingJob(ctx context.Context) error {
 		)
 	}
 
-	if err := ctx.Err(); err != nil {
-		return w.failJob(ctx, job.ID, err.Error())
-	}
-
-	outputDir := os.Getenv("EXPORTED_OUTPUT_DIR")
+	outputDir := strings.TrimSpace(os.Getenv("EXPORTED_OUTPUT_DIR"))
 	if outputDir == "" {
 		outputDir = "./output"
 	}
@@ -138,9 +165,59 @@ func (w *ExportWorker) processPendingJob(ctx context.Context) error {
 		fmt.Sprintf("job-%d-final-report.json", job.ID),
 	)
 
+	// Create a unique temporary filename in the output directory.
+	// ExportFile writes to this path; the final path is published only
+	// after the export operation succeeds.
+	tempFile, err := os.CreateTemp(
+		outputDir,
+		fmt.Sprintf("job-%d-final-report-*.tmp", job.ID),
+	)
+	if err != nil {
+		return w.failJob(
+			ctx,
+			job.ID,
+			fmt.Sprintf("create temporary export file: %v", err),
+		)
+	}
+
+	tempOutputPath := tempFile.Name()
+
+	if err := tempFile.Close(); err != nil {
+		_ = os.Remove(tempOutputPath)
+		return w.failJob(
+			ctx,
+			job.ID,
+			fmt.Sprintf("close temporary export file: %v", err),
+		)
+	}
+
+	// ExportFile may need to create or truncate its destination.
+	if err := os.Remove(tempOutputPath); err != nil {
+		return w.failJob(
+			ctx,
+			job.ID,
+			fmt.Sprintf("prepare temporary export path: %v", err),
+		)
+	}
+
+	defer func() {
+		if err := os.Remove(tempOutputPath); err != nil &&
+			!errors.Is(err, os.ErrNotExist) {
+			log.Printf(
+				"Failed to remove temporary export file for job %d: %v",
+				job.ID,
+				err,
+			)
+		}
+	}()
+
+	if err := ctx.Err(); err != nil {
+		return w.failJob(ctx, job.ID, err.Error())
+	}
+
 	reports, err := ExportFile(
-		job.AggregatedFilePath,
-		outputPath,
+		inputPath,
+		tempOutputPath,
 		job.ID,
 	)
 	if err != nil {
@@ -155,6 +232,45 @@ func (w *ExportWorker) processPendingJob(ctx context.Context) error {
 		return w.failJob(ctx, job.ID, err.Error())
 	}
 
+	// Verify the generated report before publishing it.
+	outputInfo, err := os.Lstat(tempOutputPath)
+	if err != nil {
+		return w.failJob(
+			ctx,
+			job.ID,
+			fmt.Sprintf("inspect exported file: %v", err),
+		)
+	}
+
+	if outputInfo.Mode()&os.ModeSymlink != 0 ||
+		!outputInfo.Mode().IsRegular() {
+		return w.failJob(
+			ctx,
+			job.ID,
+			"export output is not a regular file",
+		)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return w.failJob(ctx, job.ID, err.Error())
+	}
+
+	// Publish the complete output. The temporary file is in the same
+	// directory, so the rename stays on the same filesystem.
+	if err := os.Rename(tempOutputPath, outputPath); err != nil {
+		return w.failJob(
+			ctx,
+			job.ID,
+			fmt.Sprintf("publish export output: %v", err),
+		)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return w.failJob(ctx, job.ID, err.Error())
+	}
+
+	// Save report records and complete the job in one database transaction.
+	// The unique report key makes retries safe for the database records.
 	err = w.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		for _, report := range reports {
 			result := tx.Clauses(clause.OnConflict{
@@ -185,6 +301,7 @@ func (w *ExportWorker) processPendingJob(ctx context.Context) error {
 				"status":             "exported",
 				"exported_file_path": outputPath,
 				"error_message":      nil,
+				"heartbeat_at":       nil,
 			})
 
 		if result.Error != nil {
@@ -219,7 +336,8 @@ func (w *ExportWorker) processPendingJob(ctx context.Context) error {
 	return nil
 }
 
-
+// failJob reports the error and marks a currently exporting job as failed.
+// The bounded cleanup context permits the database update after cancellation.
 func (w *ExportWorker) failJob(
 	ctx context.Context,
 	jobID uint,
@@ -227,11 +345,10 @@ func (w *ExportWorker) failJob(
 ) error {
 	cleanupCtx, cancel := context.WithTimeout(
 		context.WithoutCancel(ctx),
-		5*time.Second,
+		exportCleanupTimeout,
 	)
 	defer cancel()
 
-	// Report the export-stage error.
 	if w.ErrorCollector != nil {
 		err := w.ErrorCollector.Report(
 			cleanupCtx,
@@ -251,13 +368,21 @@ func (w *ExportWorker) failJob(
 		}
 	}
 
-	// Preserve the existing job failure update.
+	if w.DB == nil {
+		return fmt.Errorf(
+			"job %d failed (%s); database is not configured",
+			jobID,
+			message,
+		)
+	}
+
 	result := w.DB.WithContext(cleanupCtx).
 		Model(&models.Job{}).
 		Where("id = ? AND status = ?", jobID, "exporting").
 		Updates(map[string]interface{}{
 			"status":        "failed",
 			"error_message": message,
+			"heartbeat_at":  nil,
 		})
 
 	if result.Error != nil {
@@ -271,7 +396,7 @@ func (w *ExportWorker) failJob(
 
 	if result.RowsAffected == 0 {
 		return fmt.Errorf(
-			"job %d could not be marked failed: %s",
+			"job %d could not be marked failed because it is no longer exporting: %s",
 			jobID,
 			message,
 		)
@@ -281,4 +406,3 @@ func (w *ExportWorker) failJob(
 
 	return fmt.Errorf("job %d export failed: %s", jobID, message)
 }
-

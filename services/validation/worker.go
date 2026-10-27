@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -68,6 +67,12 @@ func (p *WorkerPool) Run(
 						job.Record,
 					)
 
+					// Avoid publishing the result if cancellation
+					// occurred while the record was being validated.
+					if ctx.Err() != nil {
+						return
+					}
+
 					select {
 					case output <- result:
 					case <-ctx.Done():
@@ -78,7 +83,8 @@ func (p *WorkerPool) Run(
 		}()
 	}
 
-	// Wait for all workers before closing output.
+	// Wait for every worker before closing output.
+	// Only this function closes the output channel.
 	wg.Wait()
 	close(output)
 }

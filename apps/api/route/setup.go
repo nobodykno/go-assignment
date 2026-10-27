@@ -1,4 +1,3 @@
-
 package route
 
 import (
@@ -32,9 +31,9 @@ func NewRouter(db *gorm.DB) *http.ServeMux {
 	}
 
 	controllers := &controller.Controllers{
-		Upload: uploadController,
-		Source: sourceController,
-		Jobs:   jobsController,
+		Upload:         uploadController,
+		Source:         sourceController,
+		Jobs:           jobsController,
 		PipelineErrors: pipelineErrorsController,
 	}
 

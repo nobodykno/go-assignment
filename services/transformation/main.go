@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -11,8 +10,8 @@ import (
 	"syscall"
 	"time"
 
-	pipelineerrors "go-assignment/packages/errors"
 	sharedDB "go-assignment/packages/database"
+	pipelineerrors "go-assignment/packages/errors"
 )
 
 func main() {
