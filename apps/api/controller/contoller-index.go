@@ -1,6 +1,8 @@
 package controller
 
 type Controllers struct {
-	Job    *JobController
-	Upload *UploadController
+	Upload         *UploadController
+	Source         *SourceController
+	Jobs           *JobsController
+	PipelineErrors *PipelineErrorsController
 }

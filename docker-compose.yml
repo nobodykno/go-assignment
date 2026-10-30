@@ -1,3 +1,4 @@
+
 services:
   api:
     build:
@@ -7,6 +8,101 @@ services:
       - "8080:8080"
     env_file:
       - .env.production
+    environment:
+      API_PORT: "8080"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+    volumes:
+      - ./uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  validation:
+    build:
+      context: .
+      dockerfile: services/validation/Dockerfile
+    env_file:
+      - .env.production
+    environment:
+      VALIDATION_PORT: "8081"
+    expose:
+      - "8081"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8081/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  ingestion-worker:
+    build:
+      context: .
+      dockerfile: services/ingestion-worker/Dockerfile
+    env_file:
+      - .env.production
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      VALIDATION_SERVICE_URL: http://validation:8081
+      UPLOADS_DIR: /app/uploads
+    volumes:
+      - ./uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      validation:
+        condition: service_healthy
+    restart: unless-stopped
+
+  transformation:
+    build:
+      context: .
+      dockerfile: services/transformation/Dockerfile
+    env_file:
+      - .env.production
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      TRANSFORMED_OUTPUT_DIR: /app/output
+    volumes:
+      - transformation_output:/app/output
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  aggregation:
+    build:
+      context: .
+      dockerfile: services/aggregation/Dockerfile
+    env_file:
+      - .env.production
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      AGGREGATED_OUTPUT_DIR: /app/output
+    volumes:
+      - transformation_output:/app/output
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  export:
+    build:
+      context: .
+      dockerfile: services/export/Dockerfile
+    env_file:
+      - .env.production
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      EXPORTED_OUTPUT_DIR: /app/output
+    volumes:
+      - transformation_output:/app/output
     depends_on:
       postgres:
         condition: service_healthy
@@ -15,19 +111,20 @@ services:
   postgres:
     image: postgres:17
     ports:
-    - "5433:5432"
+      - "5433:5432"
     env_file:
       - .env.production
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      test:
+        - CMD-SHELL
+        - pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}
       interval: 5s
       timeout: 3s
       retries: 10
     restart: unless-stopped
-  
-
 
 volumes:
   postgres_data:
+  transformation_output:

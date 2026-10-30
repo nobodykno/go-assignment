@@ -2,8 +2,8 @@ package controller
 
 import (
 	"fmt"
+	"go-assignment/apps/api/service"
 	"net/http"
-    "go-assignment/apps/api/service"
 )
 
 func CheckHealth(
