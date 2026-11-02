@@ -164,3 +164,63 @@ func TestCollectorPersistsReportedEvent(t *testing.T) {
 		t.Errorf("expected message %q, got %q", event.Message, saved.Message)
 	}
 }
+
+func TestCollectorPersistsEventsInBatches(t *testing.T) {
+	db := openTestDB(t)
+
+	job := models.Job{
+		Name:   "collector-batch-test",
+		Status: "failed",
+	}
+
+	if err := db.Create(&job).Error; err != nil {
+		t.Fatalf("create test job: %v", err)
+	}
+
+	t.Cleanup(func() {
+		db.Where("job_id = ?", job.ID).Delete(&models.PipelineError{})
+		db.Delete(&models.Job{}, job.ID)
+	})
+
+	// More events than one batch, plus one invalid event (unknown job)
+	// that must not prevent the valid events from being saved.
+	const eventCount = 450
+
+	collector := NewCollector(db, eventCount+1)
+	collector.BatchSize = 200
+
+	ctx := context.Background()
+	go collector.Run(ctx)
+
+	for i := 0; i < eventCount; i++ {
+		if err := collector.Report(ctx, ErrorEvent{
+			JobID:   job.ID,
+			Stage:   "validation",
+			Message: "invalid record",
+		}); err != nil {
+			t.Fatalf("report event %d: %v", i, err)
+		}
+	}
+
+	if err := collector.Report(ctx, ErrorEvent{
+		JobID:   ^uint(0) >> 1,
+		Stage:   "validation",
+		Message: "event for a job that does not exist",
+	}); err != nil {
+		t.Fatalf("report invalid event: %v", err)
+	}
+
+	collector.Close()
+	collector.Wait()
+
+	var saved int64
+	if err := db.Model(&models.PipelineError{}).
+		Where("job_id = ?", job.ID).
+		Count(&saved).Error; err != nil {
+		t.Fatalf("count pipeline errors: %v", err)
+	}
+
+	if saved != eventCount {
+		t.Fatalf("expected %d saved events, got %d", eventCount, saved)
+	}
+}

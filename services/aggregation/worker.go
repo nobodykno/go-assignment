@@ -66,37 +66,17 @@ func (w *AggregationWorker) processPendingJob(ctx context.Context) error {
 		return errors.New("aggregation worker database is not configured")
 	}
 
-	var job models.Job
-
-	err := w.DB.WithContext(ctx).
-		Where("status = ?", "transformed").
-		Order("created_at ASC").
-		First(&job).Error
-
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil
-	}
-
+	job, err := jobs.ClaimNext(
+		ctx,
+		w.DB,
+		"transformed",
+		"aggregating",
+		nil,
+	)
 	if err != nil {
-		return fmt.Errorf("find transformed job: %w", err)
+		return err
 	}
-
-	// Atomically claim the job. Only the worker that changes the status
-	// from transformed to aggregating is allowed to process it.
-	claim := w.DB.WithContext(ctx).
-		Model(&models.Job{}).
-		Where("id = ? AND status = ?", job.ID, "transformed").
-		Updates(map[string]interface{}{
-			"status":        "aggregating",
-			"error_message": nil,
-			"heartbeat_at":  time.Now().UTC(),
-		})
-
-	if claim.Error != nil {
-		return fmt.Errorf("claim job %d: %w", job.ID, claim.Error)
-	}
-
-	if claim.RowsAffected == 0 {
+	if job == nil {
 		return nil
 	}
 

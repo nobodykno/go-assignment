@@ -69,37 +69,17 @@ func (w *TransformationWorker) processPendingJob(ctx context.Context) error {
 		return errors.New("transformation worker database is not configured")
 	}
 
-	var job models.Job
-
-	err := w.DB.WithContext(ctx).
-		Where("status = ?", "validated").
-		Order("created_at ASC").
-		First(&job).Error
-
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil
-	}
-
+	job, err := jobs.ClaimNext(
+		ctx,
+		w.DB,
+		"validated",
+		"transforming",
+		nil,
+	)
 	if err != nil {
-		return fmt.Errorf("find validated job: %w", err)
+		return err
 	}
-
-	// Atomically claim the job so another service instance cannot
-	// claim it while its status is still validated.
-	claim := w.DB.WithContext(ctx).
-		Model(&models.Job{}).
-		Where("id = ? AND status = ?", job.ID, "validated").
-		Updates(map[string]interface{}{
-			"status":        "transforming",
-			"error_message": nil,
-			"heartbeat_at":  time.Now().UTC(),
-		})
-
-	if claim.Error != nil {
-		return fmt.Errorf("claim job %d: %w", job.ID, claim.Error)
-	}
-
-	if claim.RowsAffected == 0 {
+	if job == nil {
 		return nil
 	}
 

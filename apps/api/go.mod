@@ -1,6 +1,6 @@
 module go-assignment/apps/api
 
-go 1.27.2
+go 1.27
 
 require (
 	github.com/bytedance/gopkg v0.1.3 // indirect

@@ -1,5 +1,29 @@
 
 services:
+  volume-init:
+    image: alpine:3.22
+    user: root
+    command: ["chown", "-R", "1001:1001", "/app/uploads", "/app/output"]
+    volumes:
+      - uploads_data:/app/uploads
+      - transformation_output:/app/output
+    restart: "no"
+
+
+  migrate:
+    build:
+      context: .
+      dockerfile: packages/cmd/migrate/Dockerfile
+    env_file:
+      - .env.production
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   api:
     build:
       context: .
@@ -13,10 +37,14 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
     volumes:
-      - ./uploads:/app/uploads
+      - uploads_data:/app/uploads
     depends_on:
+      volume-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   validation:
@@ -49,10 +77,14 @@ services:
       VALIDATION_SERVICE_URL: http://validation:8081
       UPLOADS_DIR: /app/uploads
     volumes:
-      - ./uploads:/app/uploads
+      - uploads_data:/app/uploads
     depends_on:
+      volume-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       validation:
         condition: service_healthy
     restart: unless-stopped
@@ -70,8 +102,12 @@ services:
     volumes:
       - transformation_output:/app/output
     depends_on:
+      volume-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   aggregation:
@@ -87,8 +123,12 @@ services:
     volumes:
       - transformation_output:/app/output
     depends_on:
+      volume-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   export:
@@ -104,8 +144,12 @@ services:
     volumes:
       - transformation_output:/app/output
     depends_on:
+      volume-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   postgres:
@@ -127,4 +171,5 @@ services:
 
 volumes:
   postgres_data:
+  uploads_data:
   transformation_output:

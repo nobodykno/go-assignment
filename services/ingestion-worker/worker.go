@@ -92,38 +92,23 @@ func (w *JobWorker) processPendingJob(ctx context.Context) error {
 		return err
 	}
 
-	var job models.Job
-
-	err := w.DB.WithContext(ctx).
-		Where("status = ?", "pending").
-		Order("created_at ASC").
-		First(&job).Error
-
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("find pending job: %w", err)
-	}
-
-	// Claim the job atomically and initialize its heartbeat.
-	claim := w.DB.WithContext(ctx).
-		Model(&models.Job{}).
-		Where("id = ? AND status = ?", job.ID, "pending").
-		Updates(map[string]interface{}{
-			"status":            "processing",
-			"error_message":     nil,
-			"heartbeat_at":      time.Now().UTC(),
+	// Claim the oldest pending job atomically and initialize its heartbeat.
+	job, err := jobs.ClaimNext(
+		ctx,
+		w.DB,
+		"pending",
+		"processing",
+		map[string]interface{}{
 			"total_records":     0,
 			"processed_records": 0,
 			"valid_records":     0,
 			"invalid_records":   0,
-		})
-
-	if claim.Error != nil {
-		return fmt.Errorf("claim job %d: %w", job.ID, claim.Error)
+		},
+	)
+	if err != nil {
+		return err
 	}
-	if claim.RowsAffected == 0 {
+	if job == nil {
 		return nil
 	}
 

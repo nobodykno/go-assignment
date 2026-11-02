@@ -12,6 +12,13 @@ import (
 	"gorm.io/gorm"
 )
 
+const (
+	// defaultBatchSize is the maximum number of events written per INSERT.
+	defaultBatchSize = 200
+	// defaultFlushInterval bounds how long a partial batch waits in memory.
+	defaultFlushInterval = 500 * time.Millisecond
+)
+
 type ErrorEvent struct {
 	JobID   uint
 	Stage   string
@@ -22,10 +29,15 @@ type Collector struct {
 	DB     *gorm.DB
 	Events chan ErrorEvent
 
+	// BatchSize and FlushInterval control how queued events are grouped
+	// into multi-row inserts. Zero values use the package defaults.
+	BatchSize     int
+	FlushInterval time.Duration
+
 	mu      sync.RWMutex
 	closed  bool
 	done    chan struct{}
-	workers sync.WaitGroup
+	stopped chan struct{}
 	reports sync.WaitGroup
 }
 
@@ -35,37 +47,62 @@ func NewCollector(db *gorm.DB, bufferSize int) *Collector {
 	}
 
 	return &Collector{
-		DB:     db,
-		Events: make(chan ErrorEvent, bufferSize),
-		done:   make(chan struct{}),
+		DB:      db,
+		Events:  make(chan ErrorEvent, bufferSize),
+		done:    make(chan struct{}),
+		stopped: make(chan struct{}),
 	}
 }
 
-// Run consumes error events and stores them in the database.
+// Run consumes error events and stores them in the database in batches.
+// A batch is written when it reaches BatchSize events or when
+// FlushInterval elapses, whichever comes first. Run must be called
+// exactly once.
 func (c *Collector) Run(ctx context.Context) {
-	c.workers.Add(1)
-	defer c.workers.Done()
+	defer close(c.stopped)
 
 	log.Println("Pipeline error collector started")
 	defer log.Println("Pipeline error collector stopped")
 
+	batchSize := c.batchSize()
+	batch := make([]ErrorEvent, 0, batchSize)
+
+	ticker := time.NewTicker(c.flushInterval())
+	defer ticker.Stop()
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		if err := c.persist(ctx, batch); err != nil {
+			log.Printf("Failed to persist %d pipeline error(s): %v", len(batch), err)
+		}
+		batch = batch[:0]
+	}
+
 	for {
 		select {
 		case event := <-c.Events:
-			if err := c.persist(ctx, event); err != nil {
-				log.Printf("Failed to persist pipeline error: %v", err)
+			batch = append(batch, event)
+			if len(batch) >= batchSize {
+				flush()
 			}
+
+		case <-ticker.C:
+			flush()
 
 		case <-c.done:
 			c.reports.Wait()
-			c.drain(ctx)
+			batch = c.drain(batch)
+			flush()
 			return
 
 		case <-ctx.Done():
 			// Stop accepting reports and allow in-flight reports to exit.
 			c.Close()
 			c.reports.Wait()
-			c.drain(ctx)
+			batch = c.drain(batch)
+			flush()
 			return
 		}
 	}
@@ -131,49 +168,78 @@ func (c *Collector) Close() {
 	}
 }
 
-// Wait waits for the collector goroutine to finish.
 func (c *Collector) Wait() {
-	c.workers.Wait()
+	<-c.stopped
 }
 
-// drain persists events already queued before shutdown.
-func (c *Collector) drain(ctx context.Context) {
+// drain appends events already queued before shutdown to batch.
+func (c *Collector) drain(batch []ErrorEvent) []ErrorEvent {
 	for {
 		select {
 		case event := <-c.Events:
-			if err := c.persist(ctx, event); err != nil {
-				log.Printf(
-					"Failed to persist queued pipeline error: %v",
-					err,
-				)
-			}
-
+			batch = append(batch, event)
 		default:
-			return
+			return batch
 		}
 	}
 }
 
+func (c *Collector) batchSize() int {
+	if c.BatchSize > 0 {
+		return c.BatchSize
+	}
+	return defaultBatchSize
+}
+
+func (c *Collector) flushInterval() time.Duration {
+	if c.FlushInterval > 0 {
+		return c.FlushInterval
+	}
+	return defaultFlushInterval
+}
+
 func (c *Collector) persist(
 	ctx context.Context,
-	event ErrorEvent,
+	events []ErrorEvent,
 ) error {
-	// Give database writes a bounded opportunity to finish even if
-	// the worker context was cancelled during shutdown.
 	persistCtx, cancel := context.WithTimeout(
 		context.WithoutCancel(ctx),
 		5*time.Second,
 	)
 	defer cancel()
 
-	record := models.PipelineError{
-		JobID:   event.JobID,
-		Stage:   event.Stage,
-		Message: event.Message,
+	records := make([]models.PipelineError, 0, len(events))
+	for _, event := range events {
+		records = append(records, models.PipelineError{
+			JobID:   event.JobID,
+			Stage:   event.Stage,
+			Message: event.Message,
+		})
 	}
 
-	if err := c.DB.WithContext(persistCtx).Create(&record).Error; err != nil {
-		return fmt.Errorf("save pipeline error: %w", err)
+	err := c.DB.WithContext(persistCtx).
+		CreateInBatches(&records, c.batchSize()).Error
+	if err == nil {
+		return nil
+	}
+	if len(records) == 1 {
+		return fmt.Errorf("save pipeline errors: %w", err)
+	}
+
+	failed := 0
+	for i := range records {
+		if rowErr := c.DB.WithContext(persistCtx).Create(&records[i]).Error; rowErr != nil {
+			failed++
+			log.Printf(
+				"Failed to persist pipeline error for job %d: %v",
+				records[i].JobID,
+				rowErr,
+			)
+		}
+	}
+
+	if failed > 0 {
+		return fmt.Errorf("save pipeline errors: %d of %d failed", failed, len(records))
 	}
 
 	return nil

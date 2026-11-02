@@ -12,6 +12,7 @@ import (
 	"go-assignment/apps/api/middleware"
 	"go-assignment/apps/api/route"
 	sharedDB "go-assignment/packages/database"
+	"go-assignment/packages/jobs"
 	"go-assignment/packages/progress"
 
 	"github.com/joho/godotenv"
@@ -49,6 +50,11 @@ func main() {
 	}
 
 	go tracker.Run(ctx)
+
+	// Recover jobs whose worker died without finishing its stage.
+	reaper := jobs.NewReaperFromEnv(db)
+
+	go reaper.Run(ctx)
 
 	// Register API routes and dependencies.
 	v1Router := route.NewRouter(db)

@@ -49,3 +49,15 @@ temp/
 
 # Generated pipeline exports
 exports/
+
+# Locally built service binaries
+/apps/api/api
+/services/ingestion-worker/ingestion-worker
+/services/validation/validation
+/services/transformation/transformation
+/services/aggregation/aggregation
+/services/export/export
+
+# Uploaded input files and archives
+/uploads/
+

@@ -1,0 +1,42 @@
+# Version control and tooling
+.git
+.githooks
+.github
+.vscode
+.idea
+.DS_Store
+**/.DS_Store
+
+# Secrets and local environment files
+.env
+.env.*
+**/.env
+**/.env.*
+
+# Runtime data and archives
+uploads
+output
+exports
+*.zip
+*.log
+
+# Build and test artifacts
+bin
+dist
+build
+coverage.out
+coverage.html
+*.coverprofile
+*.test
+apps/api/api
+services/ingestion-worker/ingestion-worker
+services/validation/validation
+services/transformation/transformation
+services/aggregation/aggregation
+services/export/export
+
+# Not needed inside images
+docs
+scripts
+Readme.md
+docker-compose*.yml
