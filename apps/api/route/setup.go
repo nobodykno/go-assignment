@@ -1,6 +1,7 @@
 package route
 
 import (
+	"context"
 	"net/http"
 
 	"go-assignment/apps/api/controller"
@@ -9,7 +10,8 @@ import (
 	"gorm.io/gorm"
 )
 
-func NewRouter(db *gorm.DB) *http.ServeMux {
+// NewRouter registers the v1 routes. ping checks database health.
+func NewRouter(db *gorm.DB, ping func(ctx context.Context) error) *http.ServeMux {
 	router := http.NewServeMux()
 
 	jobService := &service.JobService{
@@ -31,6 +33,7 @@ func NewRouter(db *gorm.DB) *http.ServeMux {
 	}
 
 	controllers := &controller.Controllers{
+		Health:         &controller.HealthController{Ping: ping},
 		Upload:         uploadController,
 		Source:         sourceController,
 		Jobs:           jobsController,

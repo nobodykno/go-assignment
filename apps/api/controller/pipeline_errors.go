@@ -58,6 +58,7 @@ func (c *PipelineErrorsController) GetByJobID(
 	}
 
 	if err != nil {
+		logInternalError(r, "load pipeline errors failed", err)
 		writePipelineErrorsJSON(w, http.StatusInternalServerError,
 			PipelineErrorsErrorResponse{
 				Error: "Failed to retrieve job",
@@ -73,6 +74,7 @@ func (c *PipelineErrorsController) GetByJobID(
 		Find(&pipelineErrors).Error
 
 	if err != nil {
+		logInternalError(r, "load pipeline errors failed", err)
 		writePipelineErrorsJSON(w, http.StatusInternalServerError,
 			PipelineErrorsErrorResponse{
 				Error: "Failed to retrieve pipeline errors",

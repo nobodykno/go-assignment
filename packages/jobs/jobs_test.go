@@ -199,3 +199,31 @@ func TestReaperIgnoresHealthyJob(t *testing.T) {
 		t.Fatalf("healthy job changed: status=%q retry=%d", got.Status, got.RetryCount)
 	}
 }
+
+func TestNotifierWakesSubscriberOnStatusChange(t *testing.T) {
+	db := openTestDB(t)
+	status := "notify-" + time.Now().Format("150405.000000")
+
+	notifier := NewNotifier(os.Getenv("TEST_DATABASE_URL"))
+	wake := notifier.Subscribe(status)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go notifier.Run(ctx)
+
+	// The first signal comes from (re)connecting; drain it once LISTEN
+	// is active so the next one can only come from the trigger.
+	select {
+	case <-wake:
+	case <-time.After(5 * time.Second):
+		t.Fatal("notifier did not connect")
+	}
+
+	createJob(t, db, models.Job{Name: "notify-test", Status: status})
+
+	select {
+	case <-wake:
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected a notification after inserting a job (is migration 013 applied?)")
+	}
+}

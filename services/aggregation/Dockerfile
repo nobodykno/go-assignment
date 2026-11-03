@@ -38,6 +38,9 @@ RUN mkdir -p /app/output && chown app:app /app/output
 
 ENV AGGREGATED_OUTPUT_DIR=/app/output
 
+# Health and metrics (METRICS_PORT).
+EXPOSE 9090
+
 USER app:app
 
 ENTRYPOINT ["/app/aggregation"]

@@ -6,6 +6,9 @@ import (
 	"go-assignment/apps/api/controller"
 )
 
-func RegisterHealthRoutes(router *http.ServeMux) {
-	router.HandleFunc("GET /health", controller.CheckHealth)
+func RegisterHealthRoutes(
+	router *http.ServeMux,
+	healthController *controller.HealthController,
+) {
+	router.HandleFunc("GET /health", healthController.CheckHealth)
 }

@@ -6,29 +6,18 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"go-assignment/packages/models"
 )
-
-// Record represents raw data received from a CSV, JSON, or API source.
-type Record map[string]string
-
-// TransformedRecord represents a normalized record.
-// MetricOperations defines how each numeric metric should be aggregated.
-type TransformedRecord struct {
-	Source           string             `json:"source"`
-	Date             string             `json:"date"`
-	Dimensions       map[string]string  `json:"dimensions"`
-	Metrics          map[string]float64 `json:"metrics"`
-	MetricOperations map[string]string  `json:"metric_operations,omitempty"`
-}
 
 // TransformRecord converts a raw record into a normalized record.
 // Known location and identity fields remain dimensions even when numeric.
-func TransformRecord(record Record) (TransformedRecord, error) {
+func TransformRecord(record models.RawRecord) (models.TransformedRecord, error) {
 	if len(record) == 0 {
-		return TransformedRecord{}, fmt.Errorf("record is empty")
+		return models.TransformedRecord{}, fmt.Errorf("record is empty")
 	}
 
-	result := TransformedRecord{
+	result := models.TransformedRecord{
 		Source:           strings.TrimSpace(record["source"]),
 		Dimensions:       make(map[string]string),
 		Metrics:          make(map[string]float64),
@@ -40,7 +29,7 @@ func TransformRecord(record Record) (TransformedRecord, error) {
 		value := strings.TrimSpace(rawValue)
 
 		if key == "" {
-			return TransformedRecord{}, fmt.Errorf(
+			return models.TransformedRecord{}, fmt.Errorf(
 				"record contains an empty field name",
 			)
 		}
@@ -55,7 +44,7 @@ func TransformRecord(record Record) (TransformedRecord, error) {
 		case "date":
 			normalizedDate, err := normalizeDate(value)
 			if err != nil {
-				return TransformedRecord{}, fmt.Errorf(
+				return models.TransformedRecord{}, fmt.Errorf(
 					"invalid date: %w",
 					err,
 				)
@@ -81,7 +70,7 @@ func TransformRecord(record Record) (TransformedRecord, error) {
 		}
 
 		if math.IsNaN(number) || math.IsInf(number, 0) {
-			return TransformedRecord{}, fmt.Errorf(
+			return models.TransformedRecord{}, fmt.Errorf(
 				"field %q contains a non-finite number",
 				key,
 			)

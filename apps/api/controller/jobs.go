@@ -81,6 +81,7 @@ func (c *JobsController) GetJob(
 			return
 		}
 
+		logInternalError(r, "load job failed", err)
 		writeJobsError(
 			w,
 			http.StatusInternalServerError,
@@ -109,6 +110,7 @@ func (c *JobsController) ListJobs(
 
 	jobs, err := c.JobService.GetAllJobs()
 	if err != nil {
+		logInternalError(r, "list jobs failed", err)
 		writeJobsError(
 			w,
 			http.StatusInternalServerError,

@@ -4,15 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	pipelineerrors "go-assignment/packages/errors"
-	"go-assignment/packages/jobs"
+	"go-assignment/packages/logger"
 	"go-assignment/packages/models"
+	"go-assignment/packages/worker"
 
 	"gorm.io/gorm"
 )
@@ -22,75 +22,24 @@ type AggregationWorker struct {
 	ErrorCollector *pipelineerrors.Collector
 }
 
-const aggregationPollInterval = 2 * time.Second
 const aggregationCleanupTimeout = 5 * time.Second
 
-// Run continuously checks for transformed jobs until cancelled.
-func (w *AggregationWorker) Run(ctx context.Context) {
-	ticker := time.NewTicker(aggregationPollInterval)
-	defer ticker.Stop()
-
-	log.Println("Aggregation worker started")
-	defer log.Println("Aggregation worker stopped")
-
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-
-		if err := w.processPendingJob(ctx); err != nil {
-			if ctx.Err() != nil &&
-				(errors.Is(err, context.Canceled) ||
-					errors.Is(err, context.DeadlineExceeded)) {
-				return
-			}
-
-			log.Printf("Aggregation worker error: %v", err)
-		}
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
+// Stage describes the aggregation stage for the shared worker runtime,
+// which claims jobs, keeps their heartbeat and records metrics.
+func (w *AggregationWorker) Stage() worker.Stage {
+	return worker.Stage{
+		Name:         "aggregation",
+		FromStatus:   "transformed",
+		ActiveStatus: "aggregating",
+		Process:      w.processJob,
 	}
 }
 
-// processPendingJob claims and aggregates the oldest transformed job.
-func (w *AggregationWorker) processPendingJob(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
+// processJob aggregates one claimed job and moves it to aggregated.
+func (w *AggregationWorker) processJob(ctx context.Context, job *models.Job) error {
 	if w.DB == nil {
 		return errors.New("aggregation worker database is not configured")
 	}
-
-	job, err := jobs.ClaimNext(
-		ctx,
-		w.DB,
-		"transformed",
-		"aggregating",
-		nil,
-	)
-	if err != nil {
-		return err
-	}
-	if job == nil {
-		return nil
-	}
-
-	log.Printf("Started aggregation for job %d", job.ID)
-
-	// Refresh the heartbeat while the job remains in aggregating status.
-	stopHeartbeat := jobs.StartHeartbeat(
-		ctx,
-		w.DB,
-		job.ID,
-		"aggregating",
-		jobs.DefaultHeartbeatInterval,
-	)
-	defer stopHeartbeat()
 
 	if err := ctx.Err(); err != nil {
 		return w.failJob(ctx, job.ID, err.Error())
@@ -173,11 +122,7 @@ func (w *AggregationWorker) processPendingJob(ctx context.Context) error {
 	defer func() {
 		if err := os.Remove(tempOutputPath); err != nil &&
 			!errors.Is(err, os.ErrNotExist) {
-			log.Printf(
-				"Failed to remove temporary aggregation output for job %d: %v",
-				job.ID,
-				err,
-			)
+			logger.FromContext(ctx).Warn("remove temporary output failed", "error", err)
 		}
 	}()
 
@@ -261,11 +206,7 @@ func (w *AggregationWorker) processPendingJob(ctx context.Context) error {
 		)
 	}
 
-	log.Printf(
-		"Job %d aggregation completed: output=%s",
-		job.ID,
-		outputPath,
-	)
+	logger.FromContext(ctx).Info("aggregation output written", "output", outputPath)
 
 	return nil
 }
@@ -295,11 +236,7 @@ func (w *AggregationWorker) failJob(
 		)
 
 		if err != nil {
-			log.Printf(
-				"Failed to report aggregation error for job %d: %v",
-				jobID,
-				err,
-			)
+			logger.FromContext(ctx).Warn("report pipeline error failed", "error", err)
 		}
 	}
 
@@ -336,8 +273,6 @@ func (w *AggregationWorker) failJob(
 			message,
 		)
 	}
-
-	log.Printf("Job %d aggregation failed: %s", jobID, message)
 
 	return fmt.Errorf("job %d aggregation failed: %s", jobID, message)
 }

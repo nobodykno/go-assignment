@@ -3,10 +3,12 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"go-assignment/packages/models"
 )
 
 func TestValidateRecordValidRecord(t *testing.T) {
-	record := Record{
+	record := models.RawRecord{
 		"source":    "covid",
 		"date":      "2026-10-27",
 		"cases":     "100",
@@ -24,7 +26,7 @@ func TestValidateRecordValidRecord(t *testing.T) {
 }
 
 func TestValidateRecordRejectsEmptyRecord(t *testing.T) {
-	errors := ValidateRecord(Record{})
+	errors := ValidateRecord(models.RawRecord{})
 
 	if len(errors) != 1 {
 		t.Fatalf("expected 1 error for an empty record, got %d", len(errors))
@@ -38,18 +40,18 @@ func TestValidateRecordRejectsEmptyRecord(t *testing.T) {
 func TestValidateRecordRequiresDate(t *testing.T) {
 	tests := []struct {
 		name   string
-		record Record
+		record models.RawRecord
 	}{
 		{
 			name: "missing date",
-			record: Record{
+			record: models.RawRecord{
 				"source": "covid",
 				"cases":  "100",
 			},
 		},
 		{
 			name: "empty date",
-			record: Record{
+			record: models.RawRecord{
 				"source": "covid",
 				"date":   " ",
 			},
@@ -80,7 +82,7 @@ func TestValidateRecordRequiresDate(t *testing.T) {
 }
 
 func TestValidateRecordRejectsInvalidDate(t *testing.T) {
-	record := Record{
+	record := models.RawRecord{
 		"date":   "not-a-date",
 		"source": "covid",
 	}
@@ -115,7 +117,7 @@ func TestValidateRecordAcceptsSupportedDateFormats(t *testing.T) {
 
 	for _, date := range dates {
 		t.Run(date, func(t *testing.T) {
-			errors := ValidateRecord(Record{
+			errors := ValidateRecord(models.RawRecord{
 				"date": date,
 			})
 
@@ -138,7 +140,7 @@ func TestValidateRecordRejectsNonFiniteNumbers(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			errors := ValidateRecord(Record{
+			errors := ValidateRecord(models.RawRecord{
 				"date":  "2026-10-27",
 				"cases": tt.value,
 			})
@@ -163,7 +165,7 @@ func TestValidateRecordRejectsNonFiniteNumbers(t *testing.T) {
 }
 
 func TestValidateRecordAllowsNonNumericDimensions(t *testing.T) {
-	record := Record{
+	record := models.RawRecord{
 		"date":     "2026-10-27",
 		"country":  "India",
 		"coin":     "bitcoin",
@@ -179,7 +181,7 @@ func TestValidateRecordAllowsNonNumericDimensions(t *testing.T) {
 }
 
 func TestValidateRecordWithNumber(t *testing.T) {
-	record := Record{
+	record := models.RawRecord{
 		"date":  "2026-10-27",
 		"cases": "100",
 	}
@@ -200,7 +202,7 @@ func TestValidateRecordWithNumber(t *testing.T) {
 }
 
 func TestValidateRecordDetectsDuplicateNormalizedKeys(t *testing.T) {
-	record := Record{
+	record := models.RawRecord{
 		"date":  "2026-10-27",
 		"DATE":  "2026-10-28",
 		"cases": "100",

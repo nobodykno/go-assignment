@@ -3,10 +3,12 @@ package main
 import (
 	"math"
 	"testing"
+
+	"go-assignment/packages/models"
 )
 
 func TestAggregateRecordsOperations(t *testing.T) {
-	records := []TransformedRecord{
+	records := []models.TransformedRecord{
 		{
 			Source:     "test",
 			Date:       "2026-10-27",
@@ -83,7 +85,7 @@ func TestAggregateRecordsOperations(t *testing.T) {
 }
 
 func TestAggregateRecordsKeepsDimensionsSeparate(t *testing.T) {
-	records := []TransformedRecord{
+	records := []models.TransformedRecord{
 		{
 			Source:     "open-meteo",
 			Date:       "2026-10-27",
@@ -120,7 +122,7 @@ func TestAggregateRecordsRejectsInvalidMetric(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			records := []TransformedRecord{
+			records := []models.TransformedRecord{
 				{
 					Source:  "test",
 					Date:    "2026-10-27",

@@ -16,15 +16,6 @@ import (
 	"go-assignment/packages/models"
 )
 
-// AggregatedInput is the structure produced by the aggregation service.
-type AggregatedInput struct {
-	Source      string             `json:"source"`
-	Date        string             `json:"date"`
-	Dimensions  map[string]string  `json:"dimensions"`
-	Metrics     map[string]float64 `json:"metrics"`
-	RecordCount int                `json:"record_count"`
-}
-
 // ReportGroup represents one source-specific group, such as a country,
 // crypto asset, or weather location.
 type ReportGroup struct {
@@ -66,7 +57,7 @@ func ExportFile(
 
 	decoder := json.NewDecoder(bytes.NewReader(input))
 
-	var records []AggregatedInput
+	var records []models.AggregatedRecord
 
 	if err := decoder.Decode(&records); err != nil {
 		return nil, fmt.Errorf("decode aggregated JSON: %w", err)

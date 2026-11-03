@@ -36,7 +36,8 @@ COPY --from=builder /out/api /app/api
 # Writable data directories owned by the non-root user.
 RUN mkdir -p /app/uploads && chown app:app /app/uploads
 
-EXPOSE 8080
+# API, and internal health/metrics (METRICS_PORT).
+EXPOSE 8080 9090
 
 USER app:app
 

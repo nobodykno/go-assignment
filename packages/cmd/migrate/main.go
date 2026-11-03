@@ -6,12 +6,13 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 
 	sharedDB "go-assignment/packages/database"
+	"go-assignment/packages/logger"
 	"go-assignment/packages/migrations"
 
 	"github.com/joho/godotenv"
@@ -20,8 +21,10 @@ import (
 
 func main() {
 	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found; using environment variables")
+		slog.Debug("no .env file found; using environment variables")
 	}
+
+	log := logger.Setup("migrate")
 
 	command := "up"
 	if len(os.Args) > 1 {
@@ -37,24 +40,28 @@ func main() {
 
 	db, err := sharedDB.Connect()
 	if err != nil {
-		log.Fatalf("Migration database connection failed: %v", err)
+		log.Error("migration database connection failed", "error", err)
+		os.Exit(1)
 	}
 
 	sqlDB, err := db.DB()
 	if err != nil {
-		log.Fatalf("Get SQL connection: %v", err)
+		log.Error("get SQL connection failed", "error", err)
+		os.Exit(1)
 	}
 	defer sqlDB.Close()
 
 	goose.SetBaseFS(migrations.FS)
 
 	if err := goose.SetDialect("postgres"); err != nil {
-		log.Fatalf("Set migration dialect: %v", err)
+		log.Error("set migration dialect failed", "error", err)
+		os.Exit(1)
 	}
 
 	if err := goose.RunContext(ctx, command, sqlDB, "."); err != nil {
-		log.Fatalf("Migration %q failed: %v", command, err)
+		log.Error("migration failed", "command", command, "error", err)
+		os.Exit(1)
 	}
 
-	log.Printf("Migration %q completed", command)
+	log.Info("migration completed", "command", command)
 }

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -12,8 +13,6 @@ import (
 	"go-assignment/apps/api/middleware"
 	"go-assignment/apps/api/service"
 )
-
-const uploadDir = "uploads"
 
 type UploadController struct {
 	JobService *service.JobService
@@ -80,7 +79,9 @@ func (ctrl *UploadController) UploadFile(
 	}
 
 	// 6. Create the upload directory if necessary.
+	uploadDir := uploadsDirectory()
 	if err := os.MkdirAll(uploadDir, 0750); err != nil {
+		logInternalError(r, "prepare upload directory failed", err)
 		http.Error(
 			w,
 			"Failed to prepare upload directory",
@@ -97,6 +98,7 @@ func (ctrl *UploadController) UploadFile(
 		"upload-*"+ext,
 	)
 	if err != nil {
+		logInternalError(r, "create upload file failed", err)
 		http.Error(
 			w,
 			"Failed to create stored file",
@@ -118,6 +120,7 @@ func (ctrl *UploadController) UploadFile(
 	// Restrict file permissions to the owner.
 	if err := dst.Chmod(0600); err != nil {
 		dst.Close()
+		logInternalError(r, "secure upload file failed", err)
 		http.Error(
 			w,
 			"Failed to secure uploaded file",
@@ -131,6 +134,7 @@ func (ctrl *UploadController) UploadFile(
 	closeErr := dst.Close()
 
 	if copyErr != nil || closeErr != nil {
+		logInternalError(r, "save uploaded file failed", errors.Join(copyErr, closeErr))
 		http.Error(
 			w,
 			"Failed to save uploaded file",
@@ -154,6 +158,7 @@ func (ctrl *UploadController) UploadFile(
 
 	job, err := ctrl.JobService.CreateJob(jobName, filePath)
 	if err != nil {
+		logInternalError(r, "create job failed", err)
 		http.Error(
 			w,
 			"Failed to create job",

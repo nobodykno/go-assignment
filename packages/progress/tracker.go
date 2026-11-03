@@ -2,13 +2,27 @@ package progress
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"time"
 
+	"go-assignment/packages/metrics"
 	"go-assignment/packages/models"
 
 	"gorm.io/gorm"
 )
+
+// activeStatuses are the statuses of jobs still moving through the
+// pipeline.
+var activeStatuses = []string{
+	"pending",
+	"processing",
+	"validated",
+	"transforming",
+	"transformed",
+	"aggregating",
+	"aggregated",
+	"exporting",
+}
 
 // Tracker periodically monitors active pipeline jobs.
 type Tracker struct {
@@ -26,7 +40,7 @@ func (t *Tracker) Run(ctx context.Context) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	log.Println("Progress tracker started")
+	slog.Info("progress tracker started")
 
 	// Check immediately, then periodically.
 	for {
@@ -35,12 +49,12 @@ func (t *Tracker) Run(ctx context.Context) {
 				break
 			}
 
-			log.Printf("Progress tracker error: %v", err)
+			slog.Error("progress tracker failed", "error", err)
 		}
 
 		select {
 		case <-ctx.Done():
-			log.Println("Progress tracker stopped")
+			slog.Info("progress tracker stopped")
 			return
 		case <-ticker.C:
 		}
@@ -54,16 +68,7 @@ func (t *Tracker) trackActiveJobs(ctx context.Context) error {
 	err := t.DB.WithContext(ctx).
 		Where(
 			"status IN ?",
-			[]string{
-				"pending",
-				"processing",
-				"validated",
-				"transforming",
-				"transformed",
-				"aggregating",
-				"aggregated",
-				"exporting",
-			},
+			activeStatuses,
 		).
 		Order("created_at ASC").
 		Find(&jobs).Error
@@ -71,19 +76,28 @@ func (t *Tracker) trackActiveJobs(ctx context.Context) error {
 		return err
 	}
 
-	for _, job := range jobs {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
+	// Publish queue depth per status; a growing count means a stage
+	// is falling behind.
+	counts := make(map[string]int, len(activeStatuses))
+	for _, status := range activeStatuses {
+		counts[status] = 0
+	}
 
-		log.Printf(
-			"Job progress: id=%d name=%q status=%s processed=%d total=%d",
-			job.ID,
-			job.Name,
-			job.Status,
-			job.ProcessedRecords,
-			job.TotalRecords,
+	for _, job := range jobs {
+		counts[job.Status]++
+
+		slog.Debug(
+			"job progress",
+			"job_id", job.ID,
+			"name", job.Name,
+			"status", job.Status,
+			"processed", job.ProcessedRecords,
+			"total", job.TotalRecords,
 		)
+	}
+
+	for status, count := range counts {
+		metrics.JobsInStatus.WithLabelValues(status).Set(float64(count))
 	}
 
 	return nil

@@ -3,12 +3,14 @@ package main
 import (
 	"math"
 	"testing"
+
+	"go-assignment/packages/models"
 )
 
 func TestTransformRecord(t *testing.T) {
 	tests := []struct {
 		name           string
-		input          Record
+		input          models.RawRecord
 		wantSource     string
 		wantDate       string
 		wantDimensions map[string]string
@@ -17,7 +19,7 @@ func TestTransformRecord(t *testing.T) {
 	}{
 		{
 			name: "weather record preserves coordinates as dimensions",
-			input: Record{
+			input: models.RawRecord{
 				"source":             "open-meteo",
 				"date":               "2026-10-27",
 				"latitude":           "28.61",
@@ -45,7 +47,7 @@ func TestTransformRecord(t *testing.T) {
 		},
 		{
 			name: "CoinGecko record preserves coin information as dimensions",
-			input: Record{
+			input: models.RawRecord{
 				"source":    "coingecko",
 				"date":      "2026-10-27",
 				"coin":      "bitcoin",
@@ -126,7 +128,7 @@ func TestTransformRecord(t *testing.T) {
 }
 
 func TestTransformRecordInvalidDate(t *testing.T) {
-	input := Record{
+	input := models.RawRecord{
 		"source": "test",
 		"date":   "not-a-date",
 		"cases":  "10",
@@ -150,7 +152,7 @@ func TestTransformRecordRejectsNonFiniteNumbers(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			input := Record{
+			input := models.RawRecord{
 				"source": "test",
 				"date":   "2026-10-27",
 				"cases":  tt.value,

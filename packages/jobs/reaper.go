@@ -3,11 +3,12 @@ package jobs
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"strconv"
 	"time"
 
+	"go-assignment/packages/metrics"
 	"go-assignment/packages/models"
 
 	"gorm.io/gorm"
@@ -72,17 +73,17 @@ func (r *Reaper) Run(ctx context.Context) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	log.Printf(
-		"Stalled-job reaper started: stale_after=%s max_retries=%d interval=%s",
-		r.staleAfter(),
-		r.MaxRetries,
-		interval,
+	slog.Info(
+		"stalled-job reaper started",
+		"stale_after", r.staleAfter().String(),
+		"max_retries", r.MaxRetries,
+		"interval", interval.String(),
 	)
-	defer log.Println("Stalled-job reaper stopped")
+	defer slog.Info("stalled-job reaper stopped")
 
 	for {
 		if _, err := r.ReapOnce(ctx); err != nil && ctx.Err() == nil {
-			log.Printf("Stalled-job reaper error: %v", err)
+			slog.Error("stalled-job reaper failed", "error", err)
 		}
 
 		select {
@@ -100,7 +101,7 @@ func (r *Reaper) ReapOnce(ctx context.Context) (int, error) {
 	}
 
 	cutoff := time.Now().UTC().Add(-r.staleAfter())
-	recovered := 0
+	var recovered []recovery
 
 	err := r.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var stalled []models.Job
@@ -119,10 +120,13 @@ func (r *Reaper) ReapOnce(ctx context.Context) (int, error) {
 		}
 
 		for _, job := range stalled {
-			if err := r.recoverJob(tx, job); err != nil {
+			result, err := r.recoverJob(tx, job)
+			if err != nil {
 				return err
 			}
-			recovered++
+			if result != nil {
+				recovered = append(recovered, *result)
+			}
 		}
 
 		return nil
@@ -131,13 +135,33 @@ func (r *Reaper) ReapOnce(ctx context.Context) (int, error) {
 		return 0, err
 	}
 
-	return recovered, nil
+	// Report only after the transaction has committed.
+	for _, result := range recovered {
+		metrics.JobsRecovered.WithLabelValues(result.stage, result.outcome).Inc()
+		slog.Warn(
+			"recovered stalled job",
+			"job_id", result.jobID,
+			"stage", result.stage,
+			"outcome", result.outcome,
+			"reason", result.message,
+		)
+	}
+
+	return len(recovered), nil
 }
 
-func (r *Reaper) recoverJob(tx *gorm.DB, job models.Job) error {
+// recovery describes one stalled job handled by a reaper pass.
+type recovery struct {
+	jobID   uint
+	stage   string
+	outcome string
+	message string
+}
+
+func (r *Reaper) recoverJob(tx *gorm.DB, job models.Job) (*recovery, error) {
 	stage := stalledStages[job.Status]
 
-	var message string
+	var message, outcome string
 	updates := map[string]interface{}{
 		"heartbeat_at": nil,
 	}
@@ -149,6 +173,7 @@ func (r *Reaper) recoverJob(tx *gorm.DB, job models.Job) error {
 			job.RetryCount,
 		)
 		updates["status"] = "failed"
+		outcome = "failed"
 	} else {
 		message = fmt.Sprintf(
 			"%s worker stopped responding; requeued as %s (retry %d of %d)",
@@ -159,12 +184,13 @@ func (r *Reaper) recoverJob(tx *gorm.DB, job models.Job) error {
 		)
 		updates["status"] = stage.requeueStatus
 		updates["retry_count"] = job.RetryCount + 1
+		outcome = "requeued"
 
 		if job.Status == "processing" {
 			err := tx.Where("job_id = ?", job.ID).
 				Delete(&models.JobRecord{}).Error
 			if err != nil {
-				return fmt.Errorf("clear records for job %d: %w", job.ID, err)
+				return nil, fmt.Errorf("clear records for job %d: %w", job.ID, err)
 			}
 		}
 	}
@@ -174,10 +200,10 @@ func (r *Reaper) recoverJob(tx *gorm.DB, job models.Job) error {
 		Where("id = ? AND status = ?", job.ID, job.Status).
 		Updates(updates)
 	if result.Error != nil {
-		return fmt.Errorf("recover job %d: %w", job.ID, result.Error)
+		return nil, fmt.Errorf("recover job %d: %w", job.ID, result.Error)
 	}
 	if result.RowsAffected == 0 {
-		return nil
+		return nil, nil
 	}
 
 	pipelineError := models.PipelineError{
@@ -186,12 +212,15 @@ func (r *Reaper) recoverJob(tx *gorm.DB, job models.Job) error {
 		Message: message,
 	}
 	if err := tx.Create(&pipelineError).Error; err != nil {
-		return fmt.Errorf("record recovery of job %d: %w", job.ID, err)
+		return nil, fmt.Errorf("record recovery of job %d: %w", job.ID, err)
 	}
 
-	log.Printf("Job %d: %s", job.ID, message)
-
-	return nil
+	return &recovery{
+		jobID:   job.ID,
+		stage:   stage.stage,
+		outcome: outcome,
+		message: message,
+	}, nil
 }
 
 func (r *Reaper) staleAfter() time.Duration {

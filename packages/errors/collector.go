@@ -3,10 +3,11 @@ package errors
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
+	"go-assignment/packages/metrics"
 	"go-assignment/packages/models"
 
 	"gorm.io/gorm"
@@ -61,8 +62,8 @@ func NewCollector(db *gorm.DB, bufferSize int) *Collector {
 func (c *Collector) Run(ctx context.Context) {
 	defer close(c.stopped)
 
-	log.Println("Pipeline error collector started")
-	defer log.Println("Pipeline error collector stopped")
+	slog.Debug("pipeline error collector started")
+	defer slog.Debug("pipeline error collector stopped")
 
 	batchSize := c.batchSize()
 	batch := make([]ErrorEvent, 0, batchSize)
@@ -75,7 +76,7 @@ func (c *Collector) Run(ctx context.Context) {
 			return
 		}
 		if err := c.persist(ctx, batch); err != nil {
-			log.Printf("Failed to persist %d pipeline error(s): %v", len(batch), err)
+			slog.Error("persist pipeline errors failed", "count", len(batch), "error", err)
 		}
 		batch = batch[:0]
 	}
@@ -151,6 +152,7 @@ func (c *Collector) Report(
 		return fmt.Errorf("error collector is closed")
 
 	case c.Events <- event:
+		metrics.ErrorsTotal.WithLabelValues(event.Stage).Inc()
 		return nil
 	}
 }
@@ -230,11 +232,7 @@ func (c *Collector) persist(
 	for i := range records {
 		if rowErr := c.DB.WithContext(persistCtx).Create(&records[i]).Error; rowErr != nil {
 			failed++
-			log.Printf(
-				"Failed to persist pipeline error for job %d: %v",
-				records[i].JobID,
-				rowErr,
-			)
+			slog.Error("persist pipeline error failed", "job_id", records[i].JobID, "error", rowErr)
 		}
 	}
 

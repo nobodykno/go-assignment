@@ -3,19 +3,14 @@ package main
 import (
 	"context"
 	"sync"
+
+	"go-assignment/packages/models"
 )
 
 // RecordJob contains a record and its position in the input batch.
 type RecordJob struct {
-	RecordNumber int    `json:"record_number"`
-	Record       Record `json:"record"`
-}
-
-// ValidationResult contains the record and its validation errors.
-type ValidationResult struct {
-	RecordNumber int      `json:"record_number"`
-	Record       Record   `json:"record"`
-	Errors       []string `json:"errors"`
+	RecordNumber int              `json:"record_number"`
+	Record       models.RawRecord `json:"record"`
 }
 
 // WorkerPool validates records concurrently.
@@ -27,7 +22,7 @@ type WorkerPool struct {
 func (p *WorkerPool) Run(
 	ctx context.Context,
 	input <-chan RecordJob,
-	output chan<- ValidationResult,
+	output chan<- models.ValidationResult,
 ) {
 	workerCount := p.WorkerCount
 	if workerCount <= 0 {

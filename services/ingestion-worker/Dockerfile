@@ -37,6 +37,9 @@ COPY --from=builder /out/ingestion-worker /app/ingestion-worker
 # Writable data directories owned by the non-root user.
 RUN mkdir -p /app/uploads && chown app:app /app/uploads
 
+# Health and metrics (METRICS_PORT).
+EXPOSE 9090
+
 USER app:app
 
 ENTRYPOINT ["/app/ingestion-worker"]

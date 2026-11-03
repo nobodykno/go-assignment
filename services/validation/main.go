@@ -3,16 +3,19 @@ package main
 import (
 	"context"
 	"errors"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"syscall"
 	"time"
+
+	"go-assignment/packages/logger"
 )
 
 func main() {
+	log := logger.Setup("validation")
+
 	port := os.Getenv("VALIDATION_PORT")
 	if port == "" {
 		port = "8081"
@@ -24,11 +27,7 @@ func main() {
 	if value := os.Getenv("VALIDATION_WORKERS"); value != "" {
 		parsed, err := strconv.Atoi(value)
 		if err != nil || parsed <= 0 {
-			log.Printf(
-				"Invalid VALIDATION_WORKERS value %q; using default %d",
-				value,
-				workerCount,
-			)
+			log.Warn("invalid VALIDATION_WORKERS; using default", "value", value, "workers", workerCount)
 		} else {
 			workerCount = parsed
 		}
@@ -62,24 +61,21 @@ func main() {
 		defer cancel()
 
 		if err := server.Shutdown(shutdownCtx); err != nil {
-			log.Printf("HTTP server shutdown error: %v", err)
+			log.Error("HTTP server shutdown failed", "error", err)
 
 			if closeErr := server.Close(); closeErr != nil {
-				log.Printf("HTTP server force-close error: %v", closeErr)
+				log.Error("HTTP server force-close failed", "error", closeErr)
 			}
 		}
 	}()
 
-	log.Printf(
-		"Validation service listening on :%s with %d workers",
-		port,
-		workerCount,
-	)
+	log.Info("validation service listening", "port", port, "workers", workerCount)
 
 	err := server.ListenAndServe()
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("Validation server failed: %v", err)
+		log.Error("validation server failed", "error", err)
+		os.Exit(1)
 	}
 
-	log.Println("Validation service stopped")
+	log.Info("validation service stopped")
 }

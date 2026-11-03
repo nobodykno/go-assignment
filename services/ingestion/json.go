@@ -3,53 +3,71 @@ package ingestion
 import (
 	"encoding/json"
 	"fmt"
-	"os"
+	"io"
 )
 
-// ReadJSON reads a JSON array and returns its records.
+// ReadJSON reads every record of a JSON array file into memory. Prefer
+// StreamFile for large inputs.
 func ReadJSON(filePath string) ([]RawRecord, error) {
-	file, err := os.Open(filePath)
+	return collect(func(emit EmitFunc) error {
+		return streamFile(filePath, "JSON", StreamJSON, emit)
+	})
+}
+
+// StreamJSON decodes a top-level JSON array one element at a time, so
+// only the current object is held in memory.
+func StreamJSON(r io.Reader, emit EmitFunc) error {
+	decoder := json.NewDecoder(r)
+
+	token, err := decoder.Token()
 	if err != nil {
-		return nil, fmt.Errorf("open JSON file: %w", err)
+		return fmt.Errorf("decode JSON records: %w", err)
 	}
-	defer file.Close()
-
-	decoder := json.NewDecoder(file)
-
-	var items []map[string]json.RawMessage
-
-	if err := decoder.Decode(&items); err != nil {
-		return nil, fmt.Errorf("decode JSON records: %w", err)
+	if delim, ok := token.(json.Delim); !ok || delim != '[' {
+		return fmt.Errorf("decode JSON records: expected a JSON array")
 	}
 
-	// Reject additional JSON values after the first array.
-	var extra json.RawMessage
-	if err := decoder.Decode(&extra); err == nil {
-		return nil, fmt.Errorf("JSON file contains multiple top-level values")
-	}
+	for number := 1; decoder.More(); number++ {
+		var item map[string]json.RawMessage
 
-	records := make([]RawRecord, 0, len(items))
+		if err := decoder.Decode(&item); err != nil {
+			return fmt.Errorf("decode JSON record %d: %w", number, err)
+		}
 
-	for i, item := range items {
 		if len(item) == 0 {
-			return nil, fmt.Errorf("JSON record %d is empty", i+1)
+			return fmt.Errorf("JSON record %d is empty", number)
 		}
 
-		record := make(RawRecord, len(item))
-
-		for key, value := range item {
-			var stringValue string
-
-			if err := json.Unmarshal(value, &stringValue); err == nil {
-				record[key] = stringValue
-			} else {
-				// Preserve numbers, booleans, null, and nested JSON as text.
-				record[key] = string(value)
-			}
+		if err := emit(jsonRecord(item)); err != nil {
+			return err
 		}
-
-		records = append(records, record)
 	}
 
-	return records, nil
+	// Consume the closing bracket, then reject trailing values.
+	if _, err := decoder.Token(); err != nil {
+		return fmt.Errorf("decode JSON records: %w", err)
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return fmt.Errorf("JSON file contains multiple top-level values")
+	}
+
+	return nil
+}
+
+// jsonRecord converts one JSON object into a RawRecord.
+func jsonRecord(item map[string]json.RawMessage) RawRecord {
+	record := make(RawRecord, len(item))
+
+	for key, value := range item {
+		var stringValue string
+
+		if err := json.Unmarshal(value, &stringValue); err == nil {
+			record[key] = stringValue
+		} else {
+			// Preserve numbers, booleans, null, and nested JSON as text.
+			record[key] = string(value)
+		}
+	}
+
+	return record
 }

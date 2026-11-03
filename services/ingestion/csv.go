@@ -4,31 +4,47 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
-	"os"
 	"strings"
+
+	"go-assignment/packages/models"
 )
 
-type RawRecord map[string]string
+// RawRecord is the shared input record type; the alias keeps the
+// ingestion API unchanged.
+type RawRecord = models.RawRecord
 
+// EmitFunc receives parsed records one at a time. Returning an error
+// stops parsing and is returned to the caller unchanged.
+type EmitFunc func(RawRecord) error
+
+// ReadCSV reads every record of a CSV file into memory. Prefer
+// StreamFile for large inputs.
 func ReadCSV(filePath string) ([]RawRecord, error) {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("open CSV file: %w", err)
-	}
-	defer file.Close()
+	return collect(func(emit EmitFunc) error {
+		return streamFile(filePath, "CSV", StreamCSV, emit)
+	})
+}
 
-	reader := csv.NewReader(file)
+// StreamCSV parses CSV row by row, so memory use does not grow with the
+// file size. The first row is the header; every data row must have the
+// same number of columns.
+func StreamCSV(r io.Reader, emit EmitFunc) error {
+	reader := csv.NewReader(r)
 
-	// Require every data row to have the same number of columns as the header.
+	// Column counts are checked below to produce a clearer error.
 	reader.FieldsPerRecord = -1
+	reader.ReuseRecord = true
 
 	headers, err := reader.Read()
 	if err != nil {
 		if err == io.EOF {
-			return nil, fmt.Errorf("CSV file is empty")
+			return fmt.Errorf("CSV file is empty")
 		}
-		return nil, fmt.Errorf("read CSV headers: %w", err)
+		return fmt.Errorf("read CSV headers: %w", err)
 	}
+
+	// ReuseRecord shares the slice between reads; keep a copy.
+	headers = append([]string(nil), headers...)
 
 	// Normalize and validate the headers.
 	seenHeaders := make(map[string]bool, len(headers))
@@ -37,34 +53,33 @@ func ReadCSV(filePath string) ([]RawRecord, error) {
 		header = strings.TrimSpace(header)
 
 		if header == "" {
-			return nil, fmt.Errorf("CSV header at column %d is empty", i+1)
+			return fmt.Errorf("CSV header at column %d is empty", i+1)
 		}
 
 		if seenHeaders[header] {
-			return nil, fmt.Errorf("duplicate CSV header %q", header)
+			return fmt.Errorf("duplicate CSV header %q", header)
 		}
 
 		seenHeaders[header] = true
 		headers[i] = header
 	}
 
-	var records []RawRecord
 	rowNumber := 1 // The header is row 1.
 
 	for {
 		row, err := reader.Read()
 
 		if err == io.EOF {
-			break
+			return nil
 		}
 		if err != nil {
-			return nil, fmt.Errorf("read CSV row %d: %w", rowNumber+1, err)
+			return fmt.Errorf("read CSV row %d: %w", rowNumber+1, err)
 		}
 
 		rowNumber++
 
 		if len(row) != len(headers) {
-			return nil, fmt.Errorf(
+			return fmt.Errorf(
 				"CSV row %d has %d columns; expected %d",
 				rowNumber,
 				len(row),
@@ -78,8 +93,8 @@ func ReadCSV(filePath string) ([]RawRecord, error) {
 			record[header] = strings.TrimSpace(row[i])
 		}
 
-		records = append(records, record)
+		if err := emit(record); err != nil {
+			return err
+		}
 	}
-
-	return records, nil
 }

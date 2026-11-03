@@ -2,11 +2,14 @@ package database
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"net/url"
 	"os"
 	"strconv"
 	"time"
+
+	"go-assignment/packages/logger"
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -26,7 +29,11 @@ func Connect() (*gorm.DB, error) {
 		return nil, err
 	}
 
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	// Route GORM's SQL warnings through slog so they share the
+	// service's log format.
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
+		Logger: logger.GORM(slog.Default()),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("open PostgreSQL connection: %w", err)
 	}

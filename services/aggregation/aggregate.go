@@ -9,26 +9,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"go-assignment/packages/models"
 )
-
-// TransformedRecord matches the generic transformation output.
-type TransformedRecord struct {
-	Source           string             `json:"source"`
-	Date             string             `json:"date"`
-	Dimensions       map[string]string  `json:"dimensions"`
-	Metrics          map[string]float64 `json:"metrics"`
-	MetricOperations map[string]string  `json:"metric_operations,omitempty"`
-}
-
-// AggregatedRecord contains aggregated metrics for records sharing
-// the same date, source, and dimensions.
-type AggregatedRecord struct {
-	Source      string             `json:"source"`
-	Date        string             `json:"date"`
-	Dimensions  map[string]string  `json:"dimensions"`
-	Metrics     map[string]float64 `json:"metrics"`
-	RecordCount int                `json:"record_count"`
-}
 
 // aggregationKey uniquely identifies an aggregation group.
 type aggregationKey struct {
@@ -40,13 +23,13 @@ type aggregationKey struct {
 // AggregateRecords groups records by date, source, and dimensions.
 // Each metric uses its configured aggregation operation.
 func AggregateRecords(
-	records []TransformedRecord,
-) ([]AggregatedRecord, error) {
+	records []models.TransformedRecord,
+) ([]models.AggregatedRecord, error) {
 	if len(records) == 0 {
 		return nil, fmt.Errorf("no transformed records to aggregate")
 	}
 
-	totals := make(map[string]*AggregatedRecord)
+	totals := make(map[string]*models.AggregatedRecord)
 	metricCounts := make(map[string]map[string]int)
 	operationsByGroup := make(map[string]map[string]string)
 
@@ -99,7 +82,7 @@ func AggregateRecords(
 				dimensions[name] = value
 			}
 
-			aggregate = &AggregatedRecord{
+			aggregate = &models.AggregatedRecord{
 				Source:     source,
 				Date:       date,
 				Dimensions: dimensions,
@@ -201,7 +184,7 @@ func AggregateRecords(
 		aggregate.RecordCount++
 	}
 
-	result := make([]AggregatedRecord, 0, len(totals))
+	result := make([]models.AggregatedRecord, 0, len(totals))
 
 	for key, aggregate := range totals {
 		for metricName, operation := range operationsByGroup[key] {
@@ -275,7 +258,7 @@ func AggregateFile(
 	}
 	defer inputFile.Close()
 
-	var records []TransformedRecord
+	var records []models.TransformedRecord
 
 	decoder := json.NewDecoder(inputFile)
 

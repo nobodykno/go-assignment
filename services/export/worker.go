@@ -4,15 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	pipelineerrors "go-assignment/packages/errors"
-	"go-assignment/packages/jobs"
+	"go-assignment/packages/logger"
+	"go-assignment/packages/metrics"
 	"go-assignment/packages/models"
+	"go-assignment/packages/worker"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -23,76 +24,24 @@ type ExportWorker struct {
 	ErrorCollector *pipelineerrors.Collector
 }
 
-const exportPollInterval = 2 * time.Second
 const exportCleanupTimeout = 5 * time.Second
 
-// Run continuously checks for aggregated jobs until cancelled.
-func (w *ExportWorker) Run(ctx context.Context) {
-	ticker := time.NewTicker(exportPollInterval)
-	defer ticker.Stop()
-
-	log.Println("Export worker started")
-	defer log.Println("Export worker stopped")
-
-	for {
-		if err := ctx.Err(); err != nil {
-			return
-		}
-
-		if err := w.processPendingJob(ctx); err != nil {
-			if ctx.Err() != nil &&
-				(errors.Is(err, context.Canceled) ||
-					errors.Is(err, context.DeadlineExceeded)) {
-				return
-			}
-
-			log.Printf("Export worker error: %v", err)
-		}
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
+// Stage describes the export stage for the shared worker runtime,
+// which claims jobs, keeps their heartbeat and records metrics.
+func (w *ExportWorker) Stage() worker.Stage {
+	return worker.Stage{
+		Name:         "export",
+		FromStatus:   "aggregated",
+		ActiveStatus: "exporting",
+		Process:      w.processJob,
 	}
 }
 
-// processPendingJob claims the oldest aggregated job and exports it.
-func (w *ExportWorker) processPendingJob(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
+// processJob exports one claimed job and moves it to exported.
+func (w *ExportWorker) processJob(ctx context.Context, job *models.Job) error {
 	if w.DB == nil {
 		return errors.New("export worker database is not configured")
 	}
-
-	// Atomically claim the oldest aggregated job so only one worker exports it.
-	job, err := jobs.ClaimNext(
-		ctx,
-		w.DB,
-		"aggregated",
-		"exporting",
-		nil,
-	)
-	if err != nil {
-		return err
-	}
-	if job == nil {
-		return nil
-	}
-
-	log.Printf("Started export for job %d", job.ID)
-
-	// Keep heartbeat_at updated while this worker owns the job.
-	stopHeartbeat := jobs.StartHeartbeat(
-		ctx,
-		w.DB,
-		job.ID,
-		"exporting",
-		jobs.DefaultHeartbeatInterval,
-	)
-	defer stopHeartbeat()
 
 	if err := ctx.Err(); err != nil {
 		return w.failJob(ctx, job.ID, err.Error())
@@ -185,11 +134,7 @@ func (w *ExportWorker) processPendingJob(ctx context.Context) error {
 	defer func() {
 		if err := os.Remove(tempOutputPath); err != nil &&
 			!errors.Is(err, os.ErrNotExist) {
-			log.Printf(
-				"Failed to remove temporary export file for job %d: %v",
-				job.ID,
-				err,
-			)
+			logger.FromContext(ctx).Warn("remove temporary output failed", "error", err)
 		}
 	}()
 
@@ -308,11 +253,12 @@ func (w *ExportWorker) processPendingJob(ctx context.Context) error {
 		)
 	}
 
-	log.Printf(
-		"Job %d export completed: %d report records, output=%s",
-		job.ID,
-		len(reports),
-		outputPath,
+	metrics.RecordsProcessed.WithLabelValues("export").Add(float64(len(reports)))
+
+	logger.FromContext(ctx).Info(
+		"export report written",
+		"record_count", len(reports),
+		"output", outputPath,
 	)
 
 	return nil
@@ -342,11 +288,7 @@ func (w *ExportWorker) failJob(
 		)
 
 		if err != nil {
-			log.Printf(
-				"Failed to report export error for job %d: %v",
-				jobID,
-				err,
-			)
+			logger.FromContext(ctx).Warn("report pipeline error failed", "error", err)
 		}
 	}
 
@@ -383,8 +325,6 @@ func (w *ExportWorker) failJob(
 			message,
 		)
 	}
-
-	log.Printf("Job %d export failed: %s", jobID, message)
 
 	return fmt.Errorf("job %d export failed: %s", jobID, message)
 }

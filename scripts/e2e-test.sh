@@ -4,6 +4,8 @@
 set -euo pipefail
 
 API_URL="${API_URL:-http://localhost:8080}"
+# Set API_KEY when the API has API_KEYS configured.
+API_KEY="${API_KEY:-}"
 POLL_INTERVAL=2
 MAX_ATTEMPTS=90
 
@@ -13,6 +15,11 @@ for command in curl jq; do
         exit 1
     fi
 done
+
+AUTH_ARGS=()
+if [[ -n "$API_KEY" ]]; then
+    AUTH_ARGS=(-H "Authorization: Bearer $API_KEY")
+fi
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -37,6 +44,7 @@ echo "Submitting test CSV..."
 
 RESPONSE="$(
     curl --fail --silent --show-error \
+        ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} \
         -X POST "$API_URL/v1/jobs/mixed/upload" \
         -F "name=e2e-pipeline-test" \
         -F "files=@$INPUT_FILE;type=text/csv"
@@ -50,6 +58,7 @@ echo "Waiting for the pipeline to finish..."
 for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt++)); do
     JOB_RESPONSE="$(
         curl --fail --silent --show-error \
+            ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} \
             "$API_URL/v1/jobs/$JOB_ID"
     )"
 

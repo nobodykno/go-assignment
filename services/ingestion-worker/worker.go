@@ -7,15 +7,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	pipelineerrors "go-assignment/packages/errors"
-	"go-assignment/packages/jobs"
+	"go-assignment/packages/logger"
+	"go-assignment/packages/metrics"
 	"go-assignment/packages/models"
+	"go-assignment/packages/worker"
 	"go-assignment/services/ingestion"
 
 	"gorm.io/gorm"
@@ -27,7 +28,6 @@ const (
 	maxValidationResponseBytes = 4 << 20 // 4 MiB
 	validationRequestTimeout   = 35 * time.Second
 	ingestionCleanupTimeout    = 5 * time.Second
-	ingestionPollInterval      = 2 * time.Second
 )
 
 type JobWorker struct {
@@ -36,158 +36,76 @@ type JobWorker struct {
 	ErrorCollector *pipelineerrors.Collector
 }
 
-type ValidateRequest struct {
-	JobID   uint                `json:"job_id"`
-	Records []map[string]string `json:"records"`
-}
+// maxStoredErrorMessages caps how many validation errors are copied into
+// the job's error_message; every error is still stored per record.
+const maxStoredErrorMessages = 100
 
-type ValidationResult struct {
-	RecordNumber int               `json:"record_number"`
-	Record       map[string]string `json:"record"`
-	Errors       []string          `json:"errors"`
-}
-
-type ValidateResponse struct {
-	JobID          uint               `json:"job_id"`
-	TotalRecords   int                `json:"total_records"`
-	ValidRecords   int                `json:"valid_records"`
-	InvalidRecords int                `json:"invalid_records"`
-	Results        []ValidationResult `json:"results"`
-}
-
-// Run continuously looks for pending jobs until the context is cancelled.
-func (w *JobWorker) Run(ctx context.Context) {
-	ticker := time.NewTicker(ingestionPollInterval)
-	defer ticker.Stop()
-
-	log.Println("Ingestion worker started")
-	defer log.Println("Ingestion worker stopped")
-
-	for {
-		if err := ctx.Err(); err != nil {
-			return
-		}
-
-		if err := w.processPendingJob(ctx); err != nil {
-			if (errors.Is(err, context.Canceled) ||
-				errors.Is(err, context.DeadlineExceeded)) &&
-				ctx.Err() != nil {
-				return
-			}
-
-			log.Printf("Ingestion worker error: %v", err)
-		}
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
-}
-
-// processPendingJob claims and processes the oldest pending job.
-func (w *JobWorker) processPendingJob(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	// Claim the oldest pending job atomically and initialize its heartbeat.
-	job, err := jobs.ClaimNext(
-		ctx,
-		w.DB,
-		"pending",
-		"processing",
-		map[string]interface{}{
+// Stage describes the ingestion stage for the shared worker runtime.
+// Claiming resets the counters so a requeued job starts from zero.
+func (w *JobWorker) Stage() worker.Stage {
+	return worker.Stage{
+		Name:         "ingestion",
+		FromStatus:   "pending",
+		ActiveStatus: "processing",
+		ClaimUpdates: map[string]interface{}{
 			"total_records":     0,
 			"processed_records": 0,
 			"valid_records":     0,
 			"invalid_records":   0,
 		},
-	)
+		Process: w.processJob,
+	}
+}
+
+// validationSummary accumulates results across all batches of a job.
+type validationSummary struct {
+	valid    int
+	invalid  int
+	messages []string
+	omitted  int
+}
+
+func (s *validationSummary) addError(message string) {
+	if len(s.messages) < maxStoredErrorMessages {
+		s.messages = append(s.messages, message)
+		return
+	}
+	s.omitted++
+}
+
+func (s *validationSummary) errorMessage() string {
+	message := strings.Join(s.messages, "; ")
+	if s.omitted > 0 {
+		message += fmt.Sprintf("; and %d more validation error(s)", s.omitted)
+	}
+	return message
+}
+
+// processJob streams a claimed job's input through the validation
+// service in bounded batches and moves the job to validated. Records are
+// never all held in memory: the input is read once to count records (for
+// progress) and once more to validate them.
+func (w *JobWorker) processJob(ctx context.Context, job *models.Job) error {
+	log := logger.FromContext(ctx)
+
+	stream, err := w.openStream(ctx, job)
 	if err != nil {
-		return err
-	}
-	if job == nil {
-		return nil
+		return w.failInput(ctx, job.ID, err)
 	}
 
-	// Keep the heartbeat alive during processing. Stop it when this
-	// processing attempt returns.
-	stopHeartbeat := jobs.StartHeartbeat(
-		ctx,
-		w.DB,
-		job.ID,
-		"processing",
-		jobs.DefaultHeartbeatInterval,
-	)
-	defer stopHeartbeat()
-
-	log.Printf("Started ingestion for job %d", job.ID)
-
-	if err := ctx.Err(); err != nil {
-		return w.failJob(ctx, job.ID, err.Error())
-	}
-
-	// Read records from mixed sources or a single uploaded file.
-	var records []ingestion.RawRecord
-
-	if job.SourceType == "mixed" {
-		records, err = ingestion.ReadSources(
-			ctx,
-			job.SourceConfig.Sources,
-			w.HTTPClient,
-		)
-	} else {
-		if strings.TrimSpace(job.FilePath) == "" {
-			return w.failJob(
-				ctx,
-				job.ID,
-				"job has no uploaded file path",
-			)
-		}
-
-		records, err = ingestion.ReadFile(job.FilePath)
-	}
-
+	total, err := stream.Count(ctx)
 	if err != nil {
-		if ctx.Err() != nil {
-			return w.failJob(ctx, job.ID, ctx.Err().Error())
-		}
-
-		return w.failJob(
-			ctx,
-			job.ID,
-			fmt.Sprintf("read input records: %v", err),
-		)
+		return w.failInput(ctx, job.ID, err)
 	}
-
-	if err := ctx.Err(); err != nil {
-		return w.failJob(ctx, job.ID, err.Error())
-	}
-
-	requestRecords := make([]map[string]string, 0, len(records))
-
-	for _, record := range records {
-		requestRecords = append(
-			requestRecords,
-			map[string]string(record),
-		)
-	}
-
-	if len(requestRecords) == 0 {
-		return w.failJob(
-			ctx,
-			job.ID,
-			"input sources contain no records",
-		)
+	if total == 0 {
+		return w.failJob(ctx, job.ID, "input sources contain no records")
 	}
 
 	// Set the total up front so clients can calculate progress.
 	result := w.DB.WithContext(ctx).
 		Model(&models.Job{}).
 		Where("id = ? AND status = ?", job.ID, "processing").
-		Update("total_records", len(requestRecords))
+		Update("total_records", total)
 
 	if result.Error != nil {
 		return w.failJob(
@@ -200,159 +118,168 @@ func (w *JobWorker) processPendingJob(ctx context.Context) error {
 		return fmt.Errorf("job %d is no longer processing", job.ID)
 	}
 
-	var errorMessages []string
-	totalValid := 0
-	totalInvalid := 0
+	var summary validationSummary
+	processed := 0
+	batch := make([]models.RawRecord, 0, validationBatchSize)
 
-	// Process bounded batches. Each successful batch persists its records
-	// and advances the progress counters in one database transaction.
-	for start := 0; start < len(requestRecords); {
-		if err := ctx.Err(); err != nil {
-			return w.failJob(ctx, job.ID, err.Error())
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
 		}
 
-		end, err := validationBatchEnd(
-			job.ID,
-			requestRecords,
-			start,
+		if err := w.validateBatch(ctx, job.ID, batch, processed, &summary); err != nil {
+			return err
+		}
+
+		processed += len(batch)
+		batch = batch[:0]
+
+		log.Info(
+			"validation progress",
+			"processed", processed,
+			"total", total,
+			"valid", summary.valid,
+			"invalid", summary.invalid,
 		)
-		if err != nil {
-			return w.failJob(ctx, job.ID, err.Error())
-		}
-
-		batch := requestRecords[start:end]
-
-		response, err := w.validateRecords(
-			ctx,
-			job.ID,
-			batch,
-		)
-		if err != nil {
-			if ctx.Err() != nil {
-				return w.failJob(ctx, job.ID, ctx.Err().Error())
-			}
-
-			return w.failJob(
-				ctx,
-				job.ID,
-				fmt.Sprintf(
-					"validate batch starting at record %d: %v",
-					start+1,
-					err,
-				),
-			)
-		}
-
-		// Verify each result has a unique, valid batch-local number.
-		if err := validateBatchResults(response, len(batch)); err != nil {
-			return w.failJob(
-				ctx,
-				job.ID,
-				fmt.Sprintf(
-					"invalid validation response for batch starting at record %d: %v",
-					start+1,
-					err,
-				),
-			)
-		}
-
-		// Convert batch-local numbers into original input positions.
-		for i := range response.Results {
-			response.Results[i].RecordNumber += start
-
-			for _, validationError := range response.Results[i].Errors {
-				errorMessages = append(
-					errorMessages,
-					fmt.Sprintf(
-						"record %d: %s",
-						response.Results[i].RecordNumber,
-						validationError,
-					),
-				)
-			}
-		}
-
-		if err := ctx.Err(); err != nil {
-			return w.failJob(ctx, job.ID, err.Error())
-		}
-
-		if err := w.persistValidationBatch(ctx, job.ID, response); err != nil {
-			if ctx.Err() != nil {
-				return w.failJob(ctx, job.ID, ctx.Err().Error())
-			}
-
-			return w.failJob(
-				ctx,
-				job.ID,
-				fmt.Sprintf(
-					"persist validation batch starting at record %d: %v",
-					start+1,
-					err,
-				),
-			)
-		}
-
-		totalValid += response.ValidRecords
-		totalInvalid += response.InvalidRecords
-		start = end
-
-		log.Printf(
-			"job %d validation progress: processed=%d/%d valid=%d invalid=%d",
-			job.ID,
-			start,
-			len(requestRecords),
-			totalValid,
-			totalInvalid,
-		)
+		return nil
 	}
 
-	if err := ctx.Err(); err != nil {
-		return w.failJob(ctx, job.ID, err.Error())
-	}
-
-	errorMessage := strings.Join(errorMessages, "; ")
-
-	// Advance to validated only after every batch has been persisted.
-	err = w.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		result := tx.Model(&models.Job{}).
-			Where("id = ? AND status = ?", job.ID, "processing").
-			Updates(map[string]interface{}{
-				"status":        "validated",
-				"error_message": nullableMessage(errorMessage),
-			})
-
-		if result.Error != nil {
-			return fmt.Errorf("finalize validation status: %w", result.Error)
+	err = stream.Each(ctx, func(record models.RawRecord) error {
+		batch = append(batch, record)
+		if len(batch) >= validationBatchSize {
+			return flush()
 		}
-		if result.RowsAffected == 0 {
-			return fmt.Errorf(
-				"job %d was not found or is no longer processing",
-				job.ID,
-			)
-		}
-
 		return nil
 	})
-
+	if err == nil {
+		err = flush()
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			return w.failJob(ctx, job.ID, ctx.Err().Error())
 		}
+		return w.failJob(ctx, job.ID, err.Error())
+	}
 
+	if processed != total {
 		return w.failJob(
 			ctx,
 			job.ID,
-			fmt.Sprintf("finalize validation: %v", err),
+			fmt.Sprintf("input changed while processing: counted %d records, read %d", total, processed),
 		)
 	}
 
-	log.Printf(
-		"job %d validated: total=%d valid=%d invalid=%d",
-		job.ID,
-		len(requestRecords),
-		totalValid,
-		totalInvalid,
+	// Advance to validated only after every batch has been persisted.
+	result = w.DB.WithContext(ctx).
+		Model(&models.Job{}).
+		Where("id = ? AND status = ?", job.ID, "processing").
+		Updates(map[string]interface{}{
+			"status":        "validated",
+			"error_message": nullableMessage(summary.errorMessage()),
+		})
+
+	if result.Error != nil {
+		if ctx.Err() != nil {
+			return w.failJob(ctx, job.ID, ctx.Err().Error())
+		}
+		return w.failJob(ctx, job.ID, fmt.Sprintf("finalize validation: %v", result.Error))
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("job %d was not found or is no longer processing", job.ID)
+	}
+
+	metrics.RecordsProcessed.WithLabelValues("ingestion").Add(float64(processed))
+
+	log.Info(
+		"validation completed",
+		"record_count", processed,
+		"valid", summary.valid,
+		"invalid", summary.invalid,
 	)
+
+	return nil
+}
+
+// openStream opens the job's input: its configured sources for mixed
+// jobs, otherwise the single uploaded file.
+func (w *JobWorker) openStream(ctx context.Context, job *models.Job) (*ingestion.Stream, error) {
+	if job.SourceType == "mixed" {
+		return ingestion.OpenSources(ctx, job.SourceConfig.Sources, w.HTTPClient)
+	}
+
+	if strings.TrimSpace(job.FilePath) == "" {
+		return nil, errors.New("job has no uploaded file path")
+	}
+
+	return ingestion.OpenFile(job.FilePath), nil
+}
+
+// failInput marks the job failed because its input could not be read.
+func (w *JobWorker) failInput(ctx context.Context, jobID uint, err error) error {
+	if ctx.Err() != nil {
+		return w.failJob(ctx, jobID, ctx.Err().Error())
+	}
+	return w.failJob(ctx, jobID, fmt.Sprintf("read input records: %v", err))
+}
+
+// validateBatch validates and persists one streamed batch. offset is the
+// number of records already processed, used to number records globally.
+// The batch is split further if its encoded size exceeds the request limit.
+func (w *JobWorker) validateBatch(
+	ctx context.Context,
+	jobID uint,
+	batch []models.RawRecord,
+	offset int,
+	summary *validationSummary,
+) error {
+	for start := 0; start < len(batch); {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		end, err := validationBatchEnd(jobID, batch, start)
+		if err != nil {
+			return err
+		}
+
+		firstRecord := offset + start + 1
+		chunk := batch[start:end]
+
+		response, err := w.validateRecords(ctx, jobID, chunk)
+		if err != nil {
+			return fmt.Errorf("validate batch starting at record %d: %w", firstRecord, err)
+		}
+
+		// Verify each result has a unique, valid batch-local number.
+		if err := validateBatchResults(response, len(chunk)); err != nil {
+			return fmt.Errorf(
+				"invalid validation response for batch starting at record %d: %w",
+				firstRecord,
+				err,
+			)
+		}
+
+		// Convert batch-local numbers into positions in the whole input.
+		for i := range response.Results {
+			response.Results[i].RecordNumber += offset + start
+
+			for _, validationError := range response.Results[i].Errors {
+				summary.addError(fmt.Sprintf(
+					"record %d: %s",
+					response.Results[i].RecordNumber,
+					validationError,
+				))
+			}
+		}
+
+		if err := w.persistValidationBatch(ctx, jobID, response); err != nil {
+			return fmt.Errorf("persist validation batch starting at record %d: %w", firstRecord, err)
+		}
+
+		summary.valid += response.ValidRecords
+		summary.invalid += response.InvalidRecords
+		start = end
+	}
 
 	return nil
 }
@@ -361,7 +288,7 @@ func (w *JobWorker) processPendingJob(ctx context.Context) error {
 // record count or encoded request-body size limits.
 func validationBatchEnd(
 	jobID uint,
-	records []map[string]string,
+	records []models.RawRecord,
 	start int,
 ) (int, error) {
 	if start < 0 || start >= len(records) {
@@ -374,7 +301,7 @@ func validationBatchEnd(
 	}
 
 	for {
-		body, err := json.Marshal(ValidateRequest{
+		body, err := json.Marshal(models.ValidateRequest{
 			JobID:   jobID,
 			Records: records[start:end],
 		})
@@ -402,8 +329,8 @@ func validationBatchEnd(
 func (w *JobWorker) validateRecords(
 	ctx context.Context,
 	jobID uint,
-	records []map[string]string,
-) (*ValidateResponse, error) {
+	records []models.RawRecord,
+) (*models.ValidateResponse, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -418,7 +345,7 @@ func (w *JobWorker) validateRecords(
 	}
 	validationURL = strings.TrimRight(validationURL, "/") + "/validate"
 
-	jsonBody, err := json.Marshal(ValidateRequest{
+	jsonBody, err := json.Marshal(models.ValidateRequest{
 		JobID:   jobID,
 		Records: records,
 	})
@@ -483,7 +410,7 @@ func (w *JobWorker) validateRecords(
 		)
 	}
 
-	var response ValidateResponse
+	var response models.ValidateResponse
 	if err := json.Unmarshal(responseBody, &response); err != nil {
 		return nil, fmt.Errorf("decode validation response: %w", err)
 	}
@@ -518,7 +445,7 @@ func (w *JobWorker) validateRecords(
 // validateBatchResults verifies that every submitted record has exactly
 // one result, with a valid and unique batch-local record number.
 func validateBatchResults(
-	response *ValidateResponse,
+	response *models.ValidateResponse,
 	batchSize int,
 ) error {
 	if response == nil {
@@ -584,7 +511,7 @@ func validateBatchResults(
 func (w *JobWorker) persistValidationBatch(
 	ctx context.Context,
 	jobID uint,
-	response *ValidateResponse,
+	response *models.ValidateResponse,
 ) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -677,11 +604,7 @@ func (w *JobWorker) failJob(
 		)
 
 		if err != nil {
-			log.Printf(
-				"Failed to report ingestion error for job %d: %v",
-				jobID,
-				err,
-			)
+			logger.FromContext(ctx).Warn("report pipeline error failed", "error", err)
 		}
 	}
 
@@ -709,8 +632,6 @@ func (w *JobWorker) failJob(
 			message,
 		)
 	}
-
-	log.Printf("Job %d ingestion failed: %s", jobID, message)
 
 	return fmt.Errorf("job %d ingestion failed: %s", jobID, message)
 }

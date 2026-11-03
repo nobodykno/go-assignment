@@ -2,10 +2,11 @@ package main
 
 import (
 	"context"
-	"log"
+	"errors"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -13,27 +14,37 @@ import (
 	"go-assignment/apps/api/route"
 	sharedDB "go-assignment/packages/database"
 	"go-assignment/packages/jobs"
+	"go-assignment/packages/logger"
+	"go-assignment/packages/metrics"
 	"go-assignment/packages/progress"
 
 	"github.com/joho/godotenv"
 )
 
-func main() {
-	// Load environment variables.
-	// Existing environment variables take precedence over .env values.
-	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found; using environment variables")
-	}
+// Rate limit defaults: 100 requests per minute per client on average,
+// with bursts of up to 20.
+const (
+	defaultRateLimitPerMinute = 100
+	defaultRateLimitBurst     = 20
+)
 
-	log.Println("Environment variables loaded")
+func main() {
+	// Existing environment variables take precedence over .env values.
+	envErr := godotenv.Load()
+
+	log := logger.Setup("api")
+	if envErr != nil {
+		log.Debug("no .env file found; using environment variables")
+	}
 
 	// Connect to PostgreSQL.
 	db, err := sharedDB.Connect()
 	if err != nil {
-		log.Fatalf("Database connection failed: %v", err)
+		log.Error("database connection failed", "error", err)
+		os.Exit(1)
 	}
 
-	log.Println("Connected to PostgreSQL successfully")
+	log.Info("connected to PostgreSQL")
 
 	// Create a context cancelled by an operating-system signal.
 	ctx, stop := signal.NotifyContext(
@@ -43,30 +54,61 @@ func main() {
 	)
 	defer stop()
 
-	// Start the background progress tracker.
+	// Publish queue depth per status and recover stalled jobs.
 	tracker := &progress.Tracker{
 		DB:       db,
 		Interval: 5 * time.Second,
 	}
-
 	go tracker.Run(ctx)
 
-	// Recover jobs whose worker died without finishing its stage.
 	reaper := jobs.NewReaperFromEnv(db)
-
 	go reaper.Run(ctx)
 
-	// Register API routes and dependencies.
-	v1Router := route.NewRouter(db)
+	ping := func(ctx context.Context) error {
+		sqlDB, err := db.DB()
+		if err != nil {
+			return err
+		}
+		return sqlDB.PingContext(ctx)
+	}
 
-	// Create the root router.
-	mux := http.NewServeMux()
+	// Metrics stay on an internal port, separate from the public API.
+	go metrics.Serve(ctx, ping)
 
-	// Apply rate limiting to versioned API routes.
-	v1Handler := middleware.RateLimit(
-		http.StripPrefix("/v1", v1Router),
+	proxies, err := middleware.ParseTrustedProxies(os.Getenv("TRUSTED_PROXIES"))
+	if err != nil {
+		log.Error("invalid TRUSTED_PROXIES", "error", err)
+		os.Exit(1)
+	}
+
+	apiKeys := middleware.ParseAPIKeys(os.Getenv("API_KEYS"))
+
+	// Versioned API: rate limit, then authenticate, then route.
+	// The health check is public so load balancers can probe it.
+	var v1 http.Handler = http.StripPrefix("/v1", route.NewRouter(db, ping))
+
+	if len(apiKeys) > 0 {
+		v1 = middleware.APIKeyAuth(apiKeys, "/v1/health")(v1)
+	} else {
+		log.Warn("API_KEYS is not set; API authentication is disabled")
+	}
+
+	limiter := middleware.NewRateLimiter(
+		ctx,
+		envInt("RATE_LIMIT_PER_MINUTE", defaultRateLimitPerMinute),
+		envInt("RATE_LIMIT_BURST", defaultRateLimitBurst),
+		proxies,
 	)
-	mux.Handle("/v1/", v1Handler)
+	v1 = limiter.Middleware(v1)
+
+	mux := http.NewServeMux()
+	mux.Handle("/v1/", v1)
+
+	// Every response gets security headers, a request ID, an access log
+	// line and request metrics.
+	handler := middleware.SecurityHeaders(
+		middleware.RequestLogger(proxies)(mux),
+	)
 
 	// Configure the API port.
 	port := os.Getenv("API_PORT")
@@ -76,7 +118,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:              ":" + port,
-		Handler:           mux,
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,
@@ -86,7 +128,7 @@ func main() {
 	// Shut down the server gracefully when a signal arrives.
 	go func() {
 		<-ctx.Done()
-		log.Println("Shutting down API server...")
+		log.Info("shutting down API server")
 
 		shutdownCtx, cancel := context.WithTimeout(
 			context.Background(),
@@ -95,20 +137,30 @@ func main() {
 		defer cancel()
 
 		if err := server.Shutdown(shutdownCtx); err != nil {
-			log.Printf("HTTP server shutdown error: %v", err)
+			log.Error("HTTP server shutdown failed", "error", err)
 
 			if err := server.Close(); err != nil {
-				log.Printf("Force close HTTP server: %v", err)
+				log.Error("force close HTTP server failed", "error", err)
 			}
 		}
 	}()
 
-	log.Printf("API server listening on :%s", port)
+	log.Info("API server listening", "port", port, "auth_enabled", len(apiKeys) > 0)
 
 	if err := server.ListenAndServe(); err != nil &&
-		err != http.ErrServerClosed {
-		log.Fatalf("API server failed: %v", err)
+		!errors.Is(err, http.ErrServerClosed) {
+		log.Error("API server failed", "error", err)
+		os.Exit(1)
 	}
 
-	log.Println("API server stopped")
+	log.Info("API server stopped")
+}
+
+// envInt returns a positive integer from the environment, or fallback.
+func envInt(key string, fallback int) int {
+	value, err := strconv.Atoi(os.Getenv(key))
+	if err != nil || value < 1 {
+		return fallback
+	}
+	return value
 }

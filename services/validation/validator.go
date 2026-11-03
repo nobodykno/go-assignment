@@ -6,11 +6,11 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"go-assignment/packages/models"
 )
 
-type Record map[string]string
-
-func ValidateRecord(record Record) []error {
+func ValidateRecord(record models.RawRecord) []error {
 	var validationErrors []error
 
 	if len(record) == 0 {
@@ -123,8 +123,8 @@ func isValidDate(value string) bool {
 // This response shape remains compatible with the existing validation worker.
 func ValidateRecordWithNumber(
 	recordNumber int,
-	record Record,
-) ValidationResult {
+	record models.RawRecord,
+) models.ValidationResult {
 	validationErrors := ValidateRecord(record)
 
 	errorMessages := make([]string, 0, len(validationErrors))
@@ -133,7 +133,7 @@ func ValidateRecordWithNumber(
 		errorMessages = append(errorMessages, err.Error())
 	}
 
-	return ValidationResult{
+	return models.ValidationResult{
 		RecordNumber: recordNumber,
 		Record:       record,
 		Errors:       errorMessages,

@@ -37,10 +37,9 @@ COPY --from=builder /out/transformation /app/transformation
 # Writable data directories owned by the non-root user.
 RUN mkdir -p /app/output && chown app:app /app/output
 
-ENV TRANSFORMATION_PORT=8082
 ENV TRANSFORMED_OUTPUT_DIR=/app/output
 
-EXPOSE 8082
+EXPOSE 9090
 
 USER app:app
 

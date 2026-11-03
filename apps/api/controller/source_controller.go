@@ -2,6 +2,7 @@ package controller
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -51,12 +52,10 @@ func (c *SourceController) UploadFilesAndCreateJob(
 		return
 	}
 
-	uploadsDir := strings.TrimSpace(os.Getenv("UPLOADS_DIR"))
-	if uploadsDir == "" {
-		uploadsDir = "uploads"
-	}
+	uploadsDir := uploadsDirectory()
 
 	if err := os.MkdirAll(uploadsDir, 0750); err != nil {
+		logInternalError(r, "prepare upload directory failed", err)
 		http.Error(w, "failed to prepare upload directory", http.StatusInternalServerError)
 		return
 	}
@@ -125,6 +124,7 @@ func (c *SourceController) UploadFilesAndCreateJob(
 		)
 		if err != nil {
 			_ = input.Close()
+			logInternalError(r, "create upload file failed", err)
 			http.Error(w, "failed to save uploaded file", http.StatusInternalServerError)
 			return
 		}
@@ -137,6 +137,7 @@ func (c *SourceController) UploadFilesAndCreateJob(
 		outputCloseErr := output.Close()
 
 		if copyErr != nil || inputCloseErr != nil || outputCloseErr != nil {
+			logInternalError(r, "save uploaded file failed", errors.Join(copyErr, inputCloseErr, outputCloseErr))
 			http.Error(w, "failed to save uploaded file", http.StatusInternalServerError)
 			return
 		}
@@ -156,6 +157,7 @@ func (c *SourceController) UploadFilesAndCreateJob(
 	}
 
 	if err := c.DB.WithContext(r.Context()).Create(&job).Error; err != nil {
+		logInternalError(r, "create job failed", err)
 		http.Error(w, "failed to create job", http.StatusInternalServerError)
 		return
 	}
@@ -247,6 +249,7 @@ func (c *SourceController) CreateJob(
 	}
 
 	if err := c.DB.WithContext(r.Context()).Create(&job).Error; err != nil {
+		logInternalError(r, "create job failed", err)
 		http.Error(w, "failed to create job", http.StatusInternalServerError)
 		return
 	}

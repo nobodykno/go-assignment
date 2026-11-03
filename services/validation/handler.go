@@ -6,25 +6,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+
+	"go-assignment/packages/metrics"
+	"go-assignment/packages/models"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const maxRecordsPerRequest = 1000
 
 type ValidationHandler struct {
 	Pool WorkerPool
-}
-
-type ValidateRequest struct {
-	JobID   uint     `json:"job_id"`
-	Records []Record `json:"records"`
-}
-
-type ValidateResponse struct {
-	JobID          uint               `json:"job_id"`
-	TotalRecords   int                `json:"total_records"`
-	ValidRecords   int                `json:"valid_records"`
-	InvalidRecords int                `json:"invalid_records"`
-	Results        []ValidationResult `json:"results"`
 }
 
 type ErrorResponse struct {
@@ -47,6 +39,9 @@ func NewHandler(workerCount int) http.Handler {
 
 	mux.HandleFunc("GET /health", handler.Health)
 	mux.HandleFunc("POST /validate", handler.Validate)
+	// The service is only reachable inside the Docker network, so
+	// metrics share its port.
+	mux.Handle("GET /metrics", promhttp.Handler())
 
 	return mux
 }
@@ -71,7 +66,7 @@ func (h *ValidationHandler) Validate(
 
 	decoder := json.NewDecoder(r.Body)
 
-	var request ValidateRequest
+	var request models.ValidateRequest
 
 	if err := decoder.Decode(&request); err != nil {
 		status := http.StatusBadRequest
@@ -123,7 +118,7 @@ func (h *ValidationHandler) Validate(
 	ctx := r.Context()
 
 	input := make(chan RecordJob, len(request.Records))
-	output := make(chan ValidationResult, len(request.Records))
+	output := make(chan models.ValidationResult, len(request.Records))
 
 	for i, record := range request.Records {
 		input <- RecordJob{
@@ -136,10 +131,10 @@ func (h *ValidationHandler) Validate(
 	// Run the worker pool concurrently.
 	go h.Pool.Run(ctx, input, output)
 
-	response := ValidateResponse{
+	response := models.ValidateResponse{
 		JobID:        request.JobID,
 		TotalRecords: len(request.Records),
-		Results:      make([]ValidationResult, 0, len(request.Records)),
+		Results:      make([]models.ValidationResult, 0, len(request.Records)),
 	}
 
 	for {
@@ -150,6 +145,7 @@ func (h *ValidationHandler) Validate(
 
 		case result, ok := <-output:
 			if !ok {
+				metrics.RecordsProcessed.WithLabelValues("validation").Add(float64(response.TotalRecords))
 				writeJSON(w, http.StatusOK, response)
 				return
 			}

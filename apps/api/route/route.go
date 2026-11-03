@@ -10,7 +10,7 @@ func RegisterRoutes(
 	router *http.ServeMux,
 	controllers *controller.Controllers,
 ) {
-	RegisterHealthRoutes(router)
+	RegisterHealthRoutes(router, controllers.Health)
 	RegisterUploadRoutes(router, controllers.Upload)
 	RegisterSourceRoutes(router, controllers.Source)
 	RegisterJobsRoutes(router, controllers.Jobs)

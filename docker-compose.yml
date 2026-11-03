@@ -1,4 +1,19 @@
 
+# Settings shared by every application container.
+x-app-env: &app-env
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  LOG_FORMAT: json
+  METRICS_PORT: "9090"
+
+# Workers serve /health and /metrics on METRICS_PORT.
+x-worker-healthcheck: &worker-healthcheck
+  test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9090/health || exit 1"]
+  interval: 10s
+  timeout: 3s
+  retries: 5
+  start_period: 10s
+
 services:
   volume-init:
     image: alpine:3.22
@@ -17,8 +32,7 @@ services:
     env_file:
       - .env.production
     environment:
-      DB_HOST: postgres
-      DB_PORT: "5432"
+      <<: *app-env
     depends_on:
       postgres:
         condition: service_healthy
@@ -30,14 +44,22 @@ services:
       dockerfile: apps/api/Dockerfile
     ports:
       - "8080:8080"
+    # Metrics (9090) stay inside the Docker network.
+    expose:
+      - "9090"
     env_file:
       - .env.production
     environment:
+      <<: *app-env
       API_PORT: "8080"
-      DB_HOST: postgres
-      DB_PORT: "5432"
     volumes:
       - uploads_data:/app/uploads
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/v1/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
     depends_on:
       volume-init:
         condition: service_completed_successfully
@@ -54,6 +76,7 @@ services:
     env_file:
       - .env.production
     environment:
+      LOG_FORMAT: json
       VALIDATION_PORT: "8081"
     expose:
       - "8081"
@@ -72,12 +95,14 @@ services:
     env_file:
       - .env.production
     environment:
-      DB_HOST: postgres
-      DB_PORT: "5432"
+      <<: *app-env
       VALIDATION_SERVICE_URL: http://validation:8081
       UPLOADS_DIR: /app/uploads
+    expose:
+      - "9090"
     volumes:
       - uploads_data:/app/uploads
+    healthcheck: *worker-healthcheck
     depends_on:
       volume-init:
         condition: service_completed_successfully
@@ -96,11 +121,13 @@ services:
     env_file:
       - .env.production
     environment:
-      DB_HOST: postgres
-      DB_PORT: "5432"
+      <<: *app-env
       TRANSFORMED_OUTPUT_DIR: /app/output
+    expose:
+      - "9090"
     volumes:
       - transformation_output:/app/output
+    healthcheck: *worker-healthcheck
     depends_on:
       volume-init:
         condition: service_completed_successfully
@@ -117,11 +144,13 @@ services:
     env_file:
       - .env.production
     environment:
-      DB_HOST: postgres
-      DB_PORT: "5432"
+      <<: *app-env
       AGGREGATED_OUTPUT_DIR: /app/output
+    expose:
+      - "9090"
     volumes:
       - transformation_output:/app/output
+    healthcheck: *worker-healthcheck
     depends_on:
       volume-init:
         condition: service_completed_successfully
@@ -138,11 +167,13 @@ services:
     env_file:
       - .env.production
     environment:
-      DB_HOST: postgres
-      DB_PORT: "5432"
+      <<: *app-env
       EXPORTED_OUTPUT_DIR: /app/output
+    expose:
+      - "9090"
     volumes:
       - transformation_output:/app/output
+    healthcheck: *worker-healthcheck
     depends_on:
       volume-init:
         condition: service_completed_successfully

@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"go-assignment/packages/models"
@@ -23,197 +22,23 @@ const (
 	maxAPIErrorBody    = 4096
 )
 
-// ReadSources concurrently reads and combines records from configured sources.
-// At most three sources are processed simultaneously.
-// API sources can use the Open-Meteo adapter by setting
-// source.Options["provider"] to "open-meteo".
+// ReadSources reads and combines the records of every configured source
+// in memory, in configured order. API sources are fetched at most three
+// at a time; source.Options["provider"] selects the Open-Meteo or
+// CoinGecko adapter. Prefer OpenSources for large inputs.
 func ReadSources(
 	ctx context.Context,
 	sources []models.SourceDefinition,
 	client *http.Client,
 ) ([]RawRecord, error) {
-	if len(sources) == 0 {
-		return nil, fmt.Errorf("no sources configured")
-	}
-
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	if client == nil {
-		client = &http.Client{
-			Timeout: 30 * time.Second,
-		}
-	}
-
-	type sourceResult struct {
-		index   int
-		records []RawRecord
-		err     error
-	}
-
-	workerCount := 3
-	if len(sources) < workerCount {
-		workerCount = len(sources)
-	}
-
-	jobs := make(chan int, len(sources))
-	results := make(chan sourceResult, len(sources))
-
-	for i := range sources {
-		jobs <- i
-	}
-	close(jobs)
-
-	var wg sync.WaitGroup
-
-	for i := 0; i < workerCount; i++ {
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-
-			for index := range jobs {
-				if err := ctx.Err(); err != nil {
-					results <- sourceResult{
-						index: index,
-						err:   err,
-					}
-					continue
-				}
-
-				records, err := readOneSource(
-					ctx,
-					sources[index],
-					client,
-				)
-
-				results <- sourceResult{
-					index:   index,
-					records: records,
-					err:     err,
-				}
-			}
-		}()
-	}
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// Store results by source index to preserve configured source order.
-	recordsBySource := make([][]RawRecord, len(sources))
-	errorsBySource := make([]error, len(sources))
-
-	for result := range results {
-		recordsBySource[result.index] = result.records
-		errorsBySource[result.index] = result.err
-	}
-
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	var allRecords []RawRecord
-
-	for i, source := range sources {
-		if errorsBySource[i] != nil {
-			return nil, fmt.Errorf(
-				"read source %q: %w",
-				source.Name,
-				errorsBySource[i],
-			)
-		}
-
-		allRecords = append(allRecords, recordsBySource[i]...)
-	}
-
-	return allRecords, nil
-}
-
-// readOneSource reads one configured source, preserving source attribution.
-func readOneSource(
-	ctx context.Context,
-	source models.SourceDefinition,
-	client *http.Client,
-) ([]RawRecord, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	var records []RawRecord
-	var err error
-
-	switch strings.ToLower(strings.TrimSpace(source.Type)) {
-	case "csv", "json":
-		if strings.TrimSpace(source.FilePath) == "" {
-			return nil, fmt.Errorf("file_path is required")
-		}
-
-		filePath, pathErr := resolveSourceFile(source.FilePath)
-		if pathErr != nil {
-			return nil, pathErr
-		}
-
-		records, err = ReadFile(filePath)
-
-	case "api":
-		if strings.TrimSpace(source.URL) == "" {
-			return nil, fmt.Errorf("URL is required")
-		}
-
-		body, requestErr := readAPIResponse(
-			ctx,
-			client,
-			source.URL,
-		)
-		if requestErr != nil {
-			return nil, requestErr
-		}
-
-		provider := ""
-		if source.Options != nil {
-			provider = strings.ToLower(
-				strings.TrimSpace(source.Options["provider"]),
-			)
-		}
-
-		switch provider {
-		case "open-meteo":
-			records, err = ParseOpenMeteo(body)
-
-		case "coingecko":
-			records, err = ParseCoinGecko(body)
-
-		default:
-			records, err = parseAPIRecords(body)
-		}
-
-	default:
-		return nil, fmt.Errorf(
-			"unsupported source type %q",
-			source.Type,
-		)
-	}
-
+	stream, err := OpenSources(ctx, sources, client)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	for i := range records {
-		if records[i] == nil {
-			records[i] = make(RawRecord)
-		}
-
-		records[i]["source"] = strings.TrimSpace(source.Name)
-	}
-
-	return records, nil
+	return collect(func(emit EmitFunc) error {
+		return stream.Each(ctx, emit)
+	})
 }
 
 func resolveSourceFile(filePath string) (string, error) {

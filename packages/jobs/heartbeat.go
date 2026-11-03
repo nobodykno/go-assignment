@@ -3,7 +3,7 @@ package jobs
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	"gorm.io/gorm"
@@ -47,11 +47,7 @@ func StartHeartbeat(
 
 				if result.Error != nil {
 					if heartbeatCtx.Err() == nil {
-						log.Printf(
-							"Failed to update heartbeat for job %d: %v",
-							jobID,
-							result.Error,
-						)
+						slog.Warn("update heartbeat failed", "job_id", jobID, "error", result.Error)
 					}
 					continue
 				}
